@@ -10,7 +10,6 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "СЮДА_НОВЫЙ_ТОКЕН")
-# Резервный админ — если по какой-то причине не нашли владельца
 FALLBACK_ADMIN_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
 
 DB_PATH = "messages.db"
@@ -21,7 +20,6 @@ DB_PATH = "messages.db"
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    # Соединения: business_connection_id → user_id владельца
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS connections (
             connection_id TEXT PRIMARY KEY,
@@ -30,7 +28,6 @@ def init_db():
             connected_at TEXT
         )
     """)
-    # Сообщения
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS messages (
             chat_id INTEGER,
@@ -59,18 +56,6 @@ def save_connection(conn_id: str, user_id: int, username: str):
     """, (conn_id, user_id, username or "", datetime.now().isoformat()))
     conn.commit()
     conn.close()
-
-
-def get_connection_owner(conn_id: str):
-    """Возвращает user_id владельца бизнес-аккаунта по connection_id."""
-    if not conn_id:
-        return None
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT owner_user_id FROM connections WHERE connection_id = ?", (conn_id,))
-    row = cursor.fetchone()
-    conn.close()
-    return row[0] if row else None
 
 
 def save_message(message: types.Message, business_connection_id: str):
@@ -174,23 +159,21 @@ async def cmd_start(message: types.Message):
     await message.answer(
         "👋 Бот отслеживает удалённые сообщения в Telegram Business.\n\n"
         "Подключите меня в Настройках → Telegram Business → Чат-боты.\n"
-        "После подключения все удалённые сообщения будут приходить вам."
+        "После подключения: если клиент удалит своё сообщение, я пришлю ему его обратно."
     )
 
 
 @dp.business_connection()
 async def on_business_connection(connection: types.BusinessConnection):
-    """Сохраняем, кому принадлежит бизнес-соединение."""
     owner = connection.user
     save_connection(connection.id, owner.id, owner.username or "")
     logging.info(f"🔌 Business подключён: {connection.id} → user {owner.id} (@{owner.username})")
 
-    # Уведомляем владельца, что всё работает
     try:
         await bot.send_message(
             owner.id,
             "✅ Бот подключён к вашему бизнес-аккаунту.\n"
-            "Теперь все удалённые сообщения будут приходить сюда."
+            "Теперь если клиент удалит сообщение — я отправлю ему его обратно."
         )
     except Exception as e:
         logging.error(f"Не удалось уведомить владельца: {e}")
@@ -198,9 +181,7 @@ async def on_business_connection(connection: types.BusinessConnection):
 
 @dp.business_message()
 async def on_business_message(message: types.Message):
-    """Сохраняем каждое входящее сообщение."""
     try:
-        # business_connection_id лежит в message.business_connection_id
         bc_id = getattr(message, "business_connection_id", None)
         save_message(message, bc_id)
     except Exception as e:
@@ -209,7 +190,6 @@ async def on_business_message(message: types.Message):
 
 @dp.edited_business_message()
 async def on_edited_business_message(message: types.Message):
-    """Обновляем текст, если сообщение отредактировали."""
     try:
         bc_id = getattr(message, "business_connection_id", None)
         save_message(message, bc_id)
@@ -219,53 +199,88 @@ async def on_edited_business_message(message: types.Message):
 
 @dp.deleted_business_messages()
 async def on_deleted_business_messages(event: types.BusinessMessagesDeleted):
-    """При удалении — шлём владельцу бизнес-аккаунта."""
+    """Шлём удалённое сообщение обратно тому, кто его написал."""
     bc_id = getattr(event, "business_connection_id", None)
-    owner_id = get_connection_owner(bc_id) or FALLBACK_ADMIN_ID
 
-    if not owner_id:
-        logging.warning(f"Не нашли владельца для {bc_id}")
+    if not bc_id:
+        logging.warning("Нет business_connection_id — не могу отправить")
         return
 
-    logging.info(f"🗑 Удалено {len(event.message_ids)} в чате {event.chat.id}, шлём {owner_id}")
+    logging.info(f"🗑 Удалено {len(event.message_ids)} в чате {event.chat.id}, bc={bc_id}")
 
     for msg_id in event.message_ids:
         row = get_message(event.chat.id, msg_id)
 
         if not row:
-            await bot.send_message(
-                owner_id,
-                f"🗑 В чате {event.chat.id} удалено сообщение (ID {msg_id}), но текст не сохранён."
-            )
+            logging.warning(f"Msg {msg_id} не в БД")
             continue
 
         (chat_id, message_id, user_id, bc, text, content_type, file_id, caption, date) = row
 
-        header = f"🗑 Удалено\n💬 Чат: {chat_id}\n🆔 От: {user_id}\n🕒 {date}"
+        header = f"🗑 Ваше сообщение было удалено\n🕒 {date}"
 
         try:
             if text:
-                await bot.send_message(owner_id, f"{header}\n\n💬 {text}")
+                await bot.send_message(
+                    chat_id=user_id,
+                    text=f"{header}\n\n💬 {text}",
+                    business_connection_id=bc_id
+                )
             elif content_type == "photo" and file_id:
-                await bot.send_photo(owner_id, file_id, caption=f"{header}\n📷 {caption}")
+                await bot.send_photo(
+                    chat_id=user_id, photo=file_id,
+                    caption=f"{header}\n📷 {caption}",
+                    business_connection_id=bc_id
+                )
             elif content_type == "video" and file_id:
-                await bot.send_video(owner_id, file_id, caption=f"{header}\n🎥 {caption}")
+                await bot.send_video(
+                    chat_id=user_id, video=file_id,
+                    caption=f"{header}\n🎥 {caption}",
+                    business_connection_id=bc_id
+                )
             elif content_type == "document" and file_id:
-                await bot.send_document(owner_id, file_id, caption=f"{header}\n📄 {caption}")
+                await bot.send_document(
+                    chat_id=user_id, document=file_id,
+                    caption=f"{header}\n📄 {caption}",
+                    business_connection_id=bc_id
+                )
             elif content_type == "voice" and file_id:
-                await bot.send_voice(owner_id, file_id, caption=header)
+                await bot.send_voice(
+                    chat_id=user_id, voice=file_id,
+                    caption=header, business_connection_id=bc_id
+                )
             elif content_type == "audio" and file_id:
-                await bot.send_audio(owner_id, file_id, caption=f"{header}\n🎵 {caption}")
+                await bot.send_audio(
+                    chat_id=user_id, audio=file_id,
+                    caption=f"{header}\n🎵 {caption}",
+                    business_connection_id=bc_id
+                )
             elif content_type == "sticker" and file_id:
-                await bot.send_sticker(owner_id, file_id)
-                await bot.send_message(owner_id, header)
+                await bot.send_sticker(
+                    chat_id=user_id, sticker=file_id,
+                    business_connection_id=bc_id
+                )
+                await bot.send_message(
+                    chat_id=user_id, text=header,
+                    business_connection_id=bc_id
+                )
             elif content_type == "video_note" and file_id:
-                await bot.send_video_note(owner_id, file_id)
-                await bot.send_message(owner_id, header)
+                await bot.send_video_note(
+                    chat_id=user_id, video_note=file_id,
+                    business_connection_id=bc_id
+                )
+                await bot.send_message(
+                    chat_id=user_id, text=header,
+                    business_connection_id=bc_id
+                )
             else:
-                await bot.send_message(owner_id, f"{header}\n⚠️ {content_type}")
+                await bot.send_message(
+                    chat_id=user_id,
+                    text=f"{header}\n⚠️ {content_type}",
+                    business_connection_id=bc_id
+                )
         except Exception as e:
-            logging.error(f"Forward error: {e}")
+            logging.error(f"Send error: {e}")
 
         delete_message(event.chat.id, msg_id)
 
