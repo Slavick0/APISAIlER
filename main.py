@@ -1,372 +1,293 @@
 import asyncio
 import logging
 import sys
+import sqlite3
+import os
+import subprocess
 from datetime import datetime
 
-from aiogram import Bot, Dispatcher, types, F
+from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
-from aiogram.client.session.aiohttp import AiohttpSession
 
-# ================= НАСТРОЙКИ =================
-# ОБЯЗАТЕЛЬНО СМЕНИТЕ ТОКЕН В @BotFather!
-BOT_TOKEN = "8857613656:AAFugohLIVxAr5jnR3oD8QtXo0F70M-5Ri4"
+BOT_TOKEN = os.getenv("BOT_TOKEN", "СЮДА_НОВЫЙ_ТОКЕН")
+# Резервный админ — если по какой-то причине не нашли владельца
+FALLBACK_ADMIN_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
 
-# Если у вас VPN, можно оставить None. Если прокси - укажите "socks5://IP:PORT"
-PROXY_URL = None # Например: "socks5://127.0.0.1:1080"
+DB_PATH = "messages.db"
 
-# Временная база данных (сбросится при перезапуске)
-users_db = {}
 
-# ================= ИНИЦИАЛИЗАЦИЯ =================
-if PROXY_URL:
-    session = AiohttpSession(proxy=PROXY_URL)
-    bot = Bot(token=BOT_TOKEN, session=session)
-else:
-    bot = Bot(token=BOT_TOKEN)
+# --- БАЗА ДАННЫХ ---
 
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    # Соединения: business_connection_id → user_id владельца
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS connections (
+            connection_id TEXT PRIMARY KEY,
+            owner_user_id INTEGER,
+            owner_username TEXT,
+            connected_at TEXT
+        )
+    """)
+    # Сообщения
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS messages (
+            chat_id INTEGER,
+            message_id INTEGER,
+            user_id INTEGER,
+            business_connection_id TEXT,
+            text TEXT,
+            content_type TEXT,
+            file_id TEXT,
+            caption TEXT,
+            date TEXT,
+            PRIMARY KEY (chat_id, message_id)
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_bc ON messages(business_connection_id)")
+    conn.commit()
+    conn.close()
+
+
+def save_connection(conn_id: str, user_id: int, username: str):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT OR REPLACE INTO connections (connection_id, owner_user_id, owner_username, connected_at)
+        VALUES (?, ?, ?, ?)
+    """, (conn_id, user_id, username or "", datetime.now().isoformat()))
+    conn.commit()
+    conn.close()
+
+
+def get_connection_owner(conn_id: str):
+    """Возвращает user_id владельца бизнес-аккаунта по connection_id."""
+    if not conn_id:
+        return None
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT owner_user_id FROM connections WHERE connection_id = ?", (conn_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+def save_message(message: types.Message, business_connection_id: str):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    file_id = None
+    if message.photo:
+        file_id = message.photo[-1].file_id
+    elif message.video:
+        file_id = message.video.file_id
+    elif message.document:
+        file_id = message.document.file_id
+    elif message.voice:
+        file_id = message.voice.file_id
+    elif message.audio:
+        file_id = message.audio.file_id
+    elif message.sticker:
+        file_id = message.sticker.file_id
+    elif message.video_note:
+        file_id = message.video_note.file_id
+
+    cursor.execute("""
+        INSERT OR REPLACE INTO messages
+        (chat_id, message_id, user_id, business_connection_id, text, content_type, file_id, caption, date)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        message.chat.id,
+        message.message_id,
+        message.from_user.id if message.from_user else 0,
+        business_connection_id or "",
+        message.text or "",
+        message.content_type,
+        file_id,
+        message.caption or "",
+        message.date.isoformat() if message.date else datetime.now().isoformat()
+    ))
+    conn.commit()
+    conn.close()
+
+
+def get_message(chat_id, message_id):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT chat_id, message_id, user_id, business_connection_id, text, content_type, file_id, caption, date "
+        "FROM messages WHERE chat_id = ? AND message_id = ?",
+        (chat_id, message_id)
+    )
+    row = cursor.fetchone()
+    conn.close()
+    return row
+
+
+def delete_message(chat_id, message_id):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM messages WHERE chat_id = ? AND message_id = ?", (chat_id, message_id))
+    conn.commit()
+    conn.close()
+
+
+def cleanup_old_messages(days: int = 3):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM messages WHERE date < datetime('now', ?)", (f'-{days} days',))
+    deleted = cursor.rowcount
+    conn.commit()
+    conn.close()
+    logging.info(f"🧹 Очистка: удалено {deleted} старых записей")
+
+
+# --- СИНХРОНИЗАЦИЯ С GITHUB ---
+
+async def git_sync_loop():
+    """Каждую минуту коммитим БД в репозиторий."""
+    while True:
+        await asyncio.sleep(60)
+        try:
+            subprocess.run(["git", "config", "user.email", "bot@example.com"], check=True)
+            subprocess.run(["git", "config", "user.name", "Bot"], check=True)
+            subprocess.run(["git", "add", DB_PATH], check=True)
+            result = subprocess.run(
+                ["git", "commit", "-m", f"Update DB {datetime.now().isoformat()}"],
+                capture_output=True, text=True
+            )
+            if result.returncode == 0:
+                subprocess.run(["git", "push"], check=True)
+                logging.info("📤 БД синхронизирована с GitHub")
+        except Exception as e:
+            logging.error(f"Git sync error: {e}")
+
+
+# --- БОТ ---
+
+bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Состояния для ввода своей суммы
-class BalanceStates(StatesGroup):
-    waiting_for_amount = State()
-
-# ================= БАЗА ДАННЫХ (ЗАГЛУШКА) =================
-def get_user(user_id, username, first_name):
-    if user_id not in users_db:
-        users_db[user_id] = {
-            "balance": 0.00,
-            "purchases": [],
-            "spent": 0.00,
-            "username": username,
-            "first_name": first_name,
-            "reg_date": datetime.now().strftime("%d.%m.%Y")
-        }
-    return users_db[user_id]
-
-# ================= КЛАВИАТУРЫ =================
-
-def main_menu_kb():
-    """Постоянное меню снизу (Reply Keyboard)"""
-    builder = ReplyKeyboardBuilder()
-    builder.button(text="🛍 Каталог")
-    builder.button(text="👤 Профиль")
-    builder.button(text="💵 Пополнить баланс")
-    builder.button(text="🆘 Поддержка")
-    builder.button(text="ℹ️ Информация")
-    builder.adjust(2, 2, 1) # 2 кнопки, 2 кнопки, 1 кнопка
-    return builder.as_markup(resize_keyboard=True)
-
-def catalog_inline_kb():
-    """Меню каталога"""
-    builder = InlineKeyboardBuilder()
-    builder.button(text="🧠 API-ключи для нейросетей", callback_data="cat_ai")
-    builder.button(text="🚀 Виртуальные серверы", callback_data="cat_vps")
-    builder.button(text="🛡️ Антидетект-браузеры", callback_data="cat_antidetect")
-    builder.button(text="🔑 Лицензионные ключи", callback_data="cat_licenses")
-    builder.button(text="⬅️ Назад", callback_data="back_to_start")
-    builder.adjust(1)
-    return builder.as_markup()
-
-def ai_inline_kb():
-    builder = InlineKeyboardBuilder()
-    builder.button(text="OpenAI GPT-5 — 2800 ₽", callback_data="buy_gpt5")
-    builder.button(text="Claude 4.1 Opus — 3100 ₽", callback_data="buy_claude")
-    builder.button(text="Gemini Pro — 10400 ₽", callback_data="buy_gemini")
-    builder.button(text="Mistral Medium 3 — 1780 ₽", callback_data="buy_mistral")
-    builder.button(text="Midjourney v6 — 3400 ₽", callback_data="buy_midjourney")
-    builder.button(text="DALL-E 3 — 2400 ₽", callback_data="buy_dalle")
-    builder.button(text="Runway ML — 2700 ₽", callback_data="buy_runway")
-    builder.button(text="⬅️ Назад к категориям", callback_data="back_to_catalog")
-    builder.adjust(1)
-    return builder.as_markup()
-
-def vps_inline_kb():
-    builder = InlineKeyboardBuilder()
-    builder.button(text="Базовый VPS (KVM) — 390 ₽", callback_data="buy_vps_base")
-    builder.button(text="Продуктивный VPS (NVMe) — 690 ₽", callback_data="buy_vps_pro")
-    builder.button(text="Windows VPS (RDP) — 990 ₽", callback_data="buy_vps_win")
-    builder.button(text="Игровой сервер — 1290 ₽", callback_data="buy_game")
-    builder.button(text="Сервер для стриминга — 3490 ₽", callback_data="buy_stream")
-    builder.button(text="Хранилище данных — 890 ₽", callback_data="buy_storage")
-    builder.button(text="Хостинг для ботов — 490 ₽", callback_data="buy_bots")
-    builder.button(text="Выделенные прокси — 190 ₽", callback_data="buy_proxy")
-    builder.button(text="⬅️ Назад к категориям", callback_data="back_to_catalog")
-    builder.adjust(1)
-    return builder.as_markup()
-
-def antidetect_inline_kb():
-    builder = InlineKeyboardBuilder()
-    builder.button(text="AdsPower Pro — 8900 ₽", callback_data="buy_adspower")
-    builder.button(text="Dolphinfanty Lifetime — 12900 ₽", callback_data="buy_dolphin")
-    builder.button(text="Multilogin X — 16500 ₽", callback_data="buy_multilogin")
-    builder.button(text="GoLogin Business — 9900 ₽", callback_data="buy_gologin")
-    builder.button(text="Kameleo Premium — 11900 ₽", callback_data="buy_kameleo")
-    builder.button(text="VMLogin Business — 9500 ₽", callback_data="buy_vmlogin")
-    builder.button(text="Готовые профили — 290 ₽", callback_data="buy_profiles")
-    builder.button(text="VPS + Антидетект связка — 1590 ₽", callback_data="buy_bundle")
-    builder.button(text="⬅️ Назад к категориям", callback_data="back_to_catalog")
-    builder.adjust(1)
-    return builder.as_markup()
-
-def licenses_inline_kb():
-    builder = InlineKeyboardBuilder()
-    builder.button(text="Microsoft Windows 11 Pro (Retail) — 2900 ₽", callback_data="buy_win11")
-    builder.button(text="Microsoft Office 2021 Pro Plus — 4500 ₽", callback_data="buy_office")
-    builder.button(text="Adobe Creative Cloud (год) — 18900 ₽", callback_data="buy_adobe")
-    builder.button(text="ESET NOD32 Antivirus (2 года) — 3200 ₽", callback_data="buy_eset")
-    builder.button(text="Kaspersky Internet Security (1 год) — 1800 ₽", callback_data="buy_kaspersky")
-    builder.button(text="Steam (подарочные карты 2000 ₽) — 1900 ₽", callback_data="buy_steam")
-    builder.button(text="Norton 360 Deluxe (1 год) — 3500 ₽", callback_data="buy_norton")
-    builder.button(text="Corel Draw Graphics Suite 2024 — 55000 ₽", callback_data="buy_corel")
-    builder.button(text="WinRAR (бессрочная) — 1200 ₽", callback_data="buy_winrar")
-    builder.button(text="YouTube Premium (1 год) — 6500 ₽", callback_data="buy_youtube")
-    builder.button(text="⬅️ Назад к категориям", callback_data="back_to_catalog")
-    builder.adjust(1)
-    return builder.as_markup()
-
-def balance_inline_kb():
-    builder = InlineKeyboardBuilder()
-    builder.button(text="💰 1 000 ₽", callback_data="topup_1000")
-    builder.button(text="💰 2 000 ₽", callback_data="topup_2000")
-    builder.button(text="💰 3 000 ₽", callback_data="topup_3000")
-    builder.button(text="💰 5 000 ₽", callback_data="topup_5000")
-    builder.button(text="💰 10 000 ₽", callback_data="topup_10000")
-    builder.button(text="💰 20 000 ₽", callback_data="topup_20000")
-    builder.button(text="✏️ Своя сумма", callback_data="topup_custom")
-    builder.button(text="❌ Отмена", callback_data="back_to_start")
-    builder.adjust(2, 2, 2, 1, 1)
-    return builder.as_markup()
-
-def profile_inline_kb():
-    builder = InlineKeyboardBuilder()
-    builder.button(text="📦 Мои покупки", callback_data="my_purchases")
-    builder.button(text="🧾 История пополнений", callback_data="topup_history")
-    builder.button(text="🔄 Обновить", callback_data="refresh_profile")
-    builder.adjust(1)
-    return builder.as_markup()
-
-# ================= ОБРАБОТЧИКИ =================
 
 @dp.message(CommandStart())
-async def command_start(message: types.Message):
-    user = get_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
-    text = (
-        f"👋 Добро пожаловать в наш магазин, {user['first_name']}!\n\n"
-        f"📋 Мы предлагаем:\n"
-        f"• 🧠 API-ключи для нейросетей\n"
-        f"• 🚀 Виртуальные серверы (VPS/VDS)\n"
-        f"• 🛡️ Антидетект-браузеры\n\n"
-        f"💰 Ваш текущий баланс: {user['balance']:.2f} ₽\n\n"
-        f"_Выберите нужный раздел в меню ниже_ 👇"
+async def cmd_start(message: types.Message):
+    await message.answer(
+        "👋 Бот отслеживает удалённые сообщения в Telegram Business.\n\n"
+        "Подключите меня в Настройках → Telegram Business → Чат-боты.\n"
+        "После подключения все удалённые сообщения будут приходить вам."
     )
-    await message.answer(text, reply_markup=main_menu_kb(), parse_mode="Markdown")
 
-@dp.message(F.text == "🛍 Каталог")
-async def show_catalog(message: types.Message):
-    text = "🛍 **КАТАЛОГ ТОВАРОВ**\n\nВыберите категорию:"
-    await message.answer(text, reply_markup=catalog_inline_kb(), parse_mode="Markdown")
 
-@dp.message(F.text == "💵 Пополнить баланс")
-async def show_balance(message: types.Message):
-    text = (
-        "💵 **ПОПОЛНЕНИЕ БАЛАНСА**\n\n"
-        "💳 Минимальная сумма: 1000 ₽\n\n"
-        "Выберите сумму или введите свою:"
-    )
-    await message.answer(text, reply_markup=balance_inline_kb(), parse_mode="Markdown")
+@dp.business_connection()
+async def on_business_connection(connection: types.BusinessConnection):
+    """Сохраняем, кому принадлежит бизнес-соединение."""
+    owner = connection.user
+    save_connection(connection.id, owner.id, owner.username or "")
+    logging.info(f"🔌 Business подключён: {connection.id} → user {owner.id} (@{owner.username})")
 
-@dp.message(F.text == "👤 Профиль")
-async def show_profile(message: types.Message):
-    user = get_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
-    username = f"@{user['username']}" if user['username'] else "нет"
-    text = (
-        "👤 **МОЙ ПРОФИЛЬ**\n\n"
-        "📋 **Личная информация:**\n"
-        f"🆔 ID: `{message.from_user.id}`\n"
-        f"👤 Имя: {user['first_name']}\n"
-        f"✏️ Username: {username}\n"
-        f"📅 Регистрация: {user['reg_date']}\n\n"
-        "💰 **Финансовая информация:**\n"
-        f"💵 Основной баланс: {user['balance']:.2f} ₽\n\n"
-        "🛍 **Статистика покупок:**\n"
-        f"📦 Всего заказов: {len(user['purchases'])}\n"
-        f"💸 Потрачено: {user['spent']:.2f} ₽"
-    )
-    await message.answer(text, reply_markup=profile_inline_kb(), parse_mode="Markdown")
-
-@dp.message(F.text == "🆘 Поддержка")
-async def show_support(message: types.Message):
-    text = (
-        "🆘 **ПОДДЕРЖКА**\n\n"
-        "По всем вопросам пишите нашему саппорту\n\n"
-        "График работы: 10:00-22:00 мск\n\n"
-        "👨‍💻 Связаться: @admin_username"
-    )
-    await message.answer(text, parse_mode="Markdown")
-
-@dp.message(F.text == "ℹ️ Информация")
-async def show_info(message: types.Message):
-    await message.answer("ℹ️ Это тестовый бот-магазин. Все данные временные.", reply_markup=main_menu_kb())
-
-# --- CALLBACKS: КАТАЛОГ ---
-
-@dp.callback_query(F.data == "back_to_start")
-async def back_to_start(callback: types.CallbackQuery):
-    await callback.message.delete()
-    await callback.answer()
-
-@dp.callback_query(F.data == "back_to_catalog")
-async def back_to_catalog(callback: types.CallbackQuery):
-    text = "🛍 **КАТАЛОГ ТОВАРОВ**\n\nВыберите категорию:"
-    await callback.message.edit_text(text, reply_markup=catalog_inline_kb(), parse_mode="Markdown")
-    await callback.answer()
-
-@dp.callback_query(F.data == "cat_ai")
-async def cat_ai(callback: types.CallbackQuery):
-    text = (
-        "🧠 **API-КЛЮЧИ ДЛЯ НЕЙРОСЕТЕЙ**\n\n"
-        "Доступ к самым мощным нейросетям мира\n\n"
-        "**Выберите товар:**"
-    )
-    await callback.message.edit_text(text, reply_markup=ai_inline_kb(), parse_mode="Markdown")
-    await callback.answer()
-
-@dp.callback_query(F.data == "cat_vps")
-async def cat_vps(callback: types.CallbackQuery):
-    text = (
-        "🚀 **ВИРТУАЛЬНЫЕ СЕРВЕРЫ**\n\n"
-        "VPS/VDS для любых задач\n\n"
-        "**Выберите товар:**"
-    )
-    await callback.message.edit_text(text, reply_markup=vps_inline_kb(), parse_mode="Markdown")
-    await callback.answer()
-
-@dp.callback_query(F.data == "cat_antidetect")
-async def cat_antidetect(callback: types.CallbackQuery):
-    text = (
-        "🛡️ **АНТИДЕТЕКТ-БРАУЗЕРЫ**\n\n"
-        "Профессиональные инструменты для мультиаккаунтинга\n\n"
-        "**Выберите товар:**"
-    )
-    await callback.message.edit_text(text, reply_markup=antidetect_inline_kb(), parse_mode="Markdown")
-    await callback.answer()
-
-@dp.callback_query(F.data == "cat_licenses")
-async def cat_licenses(callback: types.CallbackQuery):
-    text = (
-        "🔑 **ЛИЦЕНЗИОННЫЕ КЛЮЧИ**\n\n"
-        "Официальное ПО и сервисы по выгодным ценам\n\n"
-        "**Выберите товар:**"
-    )
-    await callback.message.edit_text(text, reply_markup=licenses_inline_kb(), parse_mode="Markdown")
-    await callback.answer()
-
-# --- CALLBACKS: ПОКУПКА ---
-
-@dp.callback_query(F.data.startswith("buy_"))
-async def process_buy(callback: types.CallbackQuery):
-    item_code = callback.data.replace("buy_", "")
-    
-    # Словарь цен для проверки (можно вынести в БД)
-    prices = {
-        "gpt5": 2800, "claude": 3100, "gemini": 10400, "mistral": 1780,
-        "midjourney": 3400, "dalle": 2400, "runway": 2700,
-        "vps_base": 390, "vps_pro": 690, "vps_win": 990, "game": 1290,
-        "stream": 3490, "storage": 890, "bots": 490, "proxy": 190,
-        "adspower": 8900, "dolphin": 12900, "multilogin": 16500, "gologin": 9900,
-        "kameleo": 11900, "vmlogin": 9500, "profiles": 290, "bundle": 1590,
-        "win11": 2900, "office": 4500, "adobe": 18900, "eset": 3200,
-        "kaspersky": 1800, "steam": 1900, "norton": 3500, "corel": 55000,
-        "winrar": 1200, "youtube": 6500
-    }
-    
-    price = prices.get(item_code, 0)
-    user = get_user(callback.from_user.id, callback.from_user.username, callback.from_user.first_name)
-    
-    if user["balance"] < price:
-        await callback.answer("❌ Недостаточно средств! Пополните баланс.", show_alert=True)
-        return
-
-    # Списание баланса
-    user["balance"] -= price
-    user["spent"] += price
-    user["purchases"].append({"item": item_code, "price": price, "date": datetime.now().strftime("%d.%m.%Y %H:%M")})
-    
-    await callback.message.answer(
-        f"✅ **Успешная покупка!**\n\n"
-        f"Товар: `{item_code}`\n"
-        f"Списано: {price} ₽\n"
-        f"Остаток: {user['balance']:.2f} ₽\n\n"
-        f"Ссылка на товар/ключ: `https://example.com/key`"
-    )
-    await callback.answer("Товар куплен!")
-
-# --- CALLBACKS: ПОПОЛНЕНИЕ ---
-
-@dp.callback_query(F.data.startswith("topup_"))
-async def process_topup(callback: types.CallbackQuery, state: FSMContext):
-    if callback.data == "topup_custom":
-        await state.set_state(BalanceStates.waiting_for_amount)
-        await callback.message.answer("✏️ Введите сумму пополнения (целое число):")
-        await callback.answer()
-        return
-
-    amount = int(callback.data.replace("topup_", ""))
-    user = get_user(callback.from_user.id, callback.from_user.username, callback.from_user.first_name)
-    user["balance"] += amount
-    
-    await callback.message.answer(f"✅ Баланс успешно пополнен на {amount} ₽!\nТекущий баланс: {user['balance']:.2f} ₽")
-    await callback.answer("Баланс пополнен!")
-
-@dp.message(BalanceStates.waiting_for_amount)
-async def process_custom_amount(message: types.Message, state: FSMContext):
+    # Уведомляем владельца, что всё работает
     try:
-        amount = int(message.text)
-        if amount < 1000:
-            await message.answer("❌ Минимальная сумма пополнения 1000 ₽. Попробуйте снова:")
-            return
-        
-        user = get_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
-        user["balance"] += amount
-        await state.clear()
-        await message.answer(f"✅ Баланс успешно пополнен на {amount} ₽!\nТекущий баланс: {user['balance']:.2f} ₽", reply_markup=main_menu_kb())
-    except ValueError:
-        await message.answer("❌ Пожалуйста, введите целое число:")
+        await bot.send_message(
+            owner.id,
+            "✅ Бот подключён к вашему бизнес-аккаунту.\n"
+            "Теперь все удалённые сообщения будут приходить сюда."
+        )
+    except Exception as e:
+        logging.error(f"Не удалось уведомить владельца: {e}")
 
-# --- CALLBACKS: ПРОФИЛЬ ---
 
-@dp.callback_query(F.data == "refresh_profile")
-async def refresh_profile(callback: types.CallbackQuery):
-    # Просто перезапускаем профиль
-    await callback.message.delete()
-    await show_profile(callback.message)
-    await callback.answer("Обновлено!")
+@dp.business_message()
+async def on_business_message(message: types.Message):
+    """Сохраняем каждое входящее сообщение."""
+    try:
+        # business_connection_id лежит в message.business_connection_id
+        bc_id = getattr(message, "business_connection_id", None)
+        save_message(message, bc_id)
+    except Exception as e:
+        logging.error(f"Save error: {e}")
 
-@dp.callback_query(F.data == "my_purchases")
-async def my_purchases(callback: types.CallbackQuery):
-    user = get_user(callback.from_user.id, callback.from_user.username, callback.from_user.first_name)
-    if not user["purchases"]:
-        await callback.answer("У вас пока нет покупок.", show_alert=True)
+
+@dp.edited_business_message()
+async def on_edited_business_message(message: types.Message):
+    """Обновляем текст, если сообщение отредактировали."""
+    try:
+        bc_id = getattr(message, "business_connection_id", None)
+        save_message(message, bc_id)
+    except Exception as e:
+        logging.error(f"Edit error: {e}")
+
+
+@dp.deleted_business_messages()
+async def on_deleted_business_messages(event: types.BusinessMessagesDeleted):
+    """При удалении — шлём владельцу бизнес-аккаунта."""
+    bc_id = getattr(event, "business_connection_id", None)
+    owner_id = get_connection_owner(bc_id) or FALLBACK_ADMIN_ID
+
+    if not owner_id:
+        logging.warning(f"Не нашли владельца для {bc_id}")
         return
-    
-    text = "📦 **МОИ ПОКУПКИ**\n\n"
-    for p in user["purchases"]:
-        text += f"• {p['item']} — {p['price']} ₽ ({p['date']})\n"
-    await callback.message.answer(text, parse_mode="Markdown")
-    await callback.answer()
 
-@dp.callback_query(F.data == "topup_history")
-async def topup_history(callback: types.CallbackQuery):
-    await callback.answer("История пополнений пуста (тестовый режим).", show_alert=True)
+    logging.info(f"🗑 Удалено {len(event.message_ids)} в чате {event.chat.id}, шлём {owner_id}")
 
-# ================= ЗАПУСК =================
+    for msg_id in event.message_ids:
+        row = get_message(event.chat.id, msg_id)
+
+        if not row:
+            await bot.send_message(
+                owner_id,
+                f"🗑 В чате {event.chat.id} удалено сообщение (ID {msg_id}), но текст не сохранён."
+            )
+            continue
+
+        (chat_id, message_id, user_id, bc, text, content_type, file_id, caption, date) = row
+
+        header = f"🗑 Удалено\n💬 Чат: {chat_id}\n🆔 От: {user_id}\n🕒 {date}"
+
+        try:
+            if text:
+                await bot.send_message(owner_id, f"{header}\n\n💬 {text}")
+            elif content_type == "photo" and file_id:
+                await bot.send_photo(owner_id, file_id, caption=f"{header}\n📷 {caption}")
+            elif content_type == "video" and file_id:
+                await bot.send_video(owner_id, file_id, caption=f"{header}\n🎥 {caption}")
+            elif content_type == "document" and file_id:
+                await bot.send_document(owner_id, file_id, caption=f"{header}\n📄 {caption}")
+            elif content_type == "voice" and file_id:
+                await bot.send_voice(owner_id, file_id, caption=header)
+            elif content_type == "audio" and file_id:
+                await bot.send_audio(owner_id, file_id, caption=f"{header}\n🎵 {caption}")
+            elif content_type == "sticker" and file_id:
+                await bot.send_sticker(owner_id, file_id)
+                await bot.send_message(owner_id, header)
+            elif content_type == "video_note" and file_id:
+                await bot.send_video_note(owner_id, file_id)
+                await bot.send_message(owner_id, header)
+            else:
+                await bot.send_message(owner_id, f"{header}\n⚠️ {content_type}")
+        except Exception as e:
+            logging.error(f"Forward error: {e}")
+
+        delete_message(event.chat.id, msg_id)
+
+
+async def periodic_cleanup():
+    while True:
+        await asyncio.sleep(86400)
+        try:
+            cleanup_old_messages(days=3)
+        except Exception as e:
+            logging.error(f"Cleanup error: {e}")
+
+
 async def main():
-    logging.basicConfig(level=logging.INFO, stream=sys.stdout)
-    print("Бот запущен...")
-    await dp.start_polling(bot, drop_pending_updates=True)
+    logging.basicConfig(level=logging.INFO, stream=sys.stdout,
+                        format="%(asctime)s [%(levelname)s] %(message)s")
+    init_db()
+    logging.info("🚀 Бот запущен")
+    asyncio.create_task(git_sync_loop())
+    asyncio.create_task(periodic_cleanup())
+    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+
 
 if __name__ == "__main__":
     asyncio.run(main())
