@@ -366,7 +366,7 @@ async def topup_history(callback: types.CallbackQuery):
 async def main():
     logging.basicConfig(level=logging.INFO, stream=sys.stdout)
     print("Бот запущен...")
-    await dp.start_polling(bot)
+    await dp.start_polling(bot, drop_pending_updates=True)
 
 if __name__ == "__main__":
     asyncio.run(main())
