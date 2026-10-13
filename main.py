@@ -10,12 +10,10 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
+ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))  # только как страховка
 
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN не задан в Secrets!")
-if not ADMIN_CHAT_ID:
-    raise ValueError("ADMIN_CHAT_ID не задан в Secrets!")
 
 DB_PATH = "messages.db"
 
@@ -177,9 +175,8 @@ dp = Dispatcher()
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
     await message.answer(
-        "👋 Бот отслеживает удалённые сообщения в Telegram Business.\n\n"
-        "Подключите меня в Настройках → Telegram Business → Чат-боты.\n\n"
-        "Если кто-то удалит сообщение — оба участника получат его текст."
+        "👋 Бот следит за удалёнными сообщениями.\n\n"
+        "Если собеседник удалит сообщение — вы получите его текст здесь."
     )
 
 
@@ -199,7 +196,7 @@ async def on_business_message(message: types.Message):
         is_from_owner = (author_id == business_owner_id)
 
         save_message(message, bc_id, is_from_owner)
-        who = "хозяин бизнеса" if is_from_owner else "собеседник"
+        who = "владелец бизнеса" if is_from_owner else "собеседник"
         logging.info(f"💾 Сохранено msg {message.message_id}, автор: {who}, чат {message.chat.id}")
     except Exception as e:
         logging.error(f"Save error: {e}")
@@ -219,7 +216,6 @@ async def on_edited_business_message(message: types.Message):
 
 async def send_copy(chat_id: int, business_connection_id: str | None, header: str,
                     text: str, content_type: str, file_id: str | None, caption: str):
-    """Универсальная отправка копии сообщения."""
     kwargs = {"chat_id": chat_id}
     if business_connection_id:
         kwargs["business_connection_id"] = business_connection_id
@@ -248,9 +244,14 @@ async def send_copy(chat_id: int, business_connection_id: str | None, header: st
 
 @dp.deleted_business_messages()
 async def on_deleted_business_messages(event: types.BusinessMessagesDeleted):
-    """Уведомление уходит ОБОИМ участникам переписки."""
+    """Уведомление идёт ВТОРОМУ участнику (тому, кто НЕ удалял)."""
     bc_id = getattr(event, "business_connection_id", None)
-    business_owner_id = get_connection_owner(bc_id) or ADMIN_CHAT_ID
+    business_owner_id = get_connection_owner(bc_id)
+
+    if not business_owner_id:
+        # Соединение не найдено — используем страховку
+        business_owner_id = ADMIN_CHAT_ID
+        logging.warning(f"Соединение {bc_id} не в БД, используем ADMIN_CHAT_ID={ADMIN_CHAT_ID}")
 
     logging.info(f"🗑 Удалено {len(event.message_ids)} в чате {event.chat.id}")
 
@@ -258,39 +259,36 @@ async def on_deleted_business_messages(event: types.BusinessMessagesDeleted):
         row = get_message(event.chat.id, msg_id)
 
         if not row:
-            logging.warning(f"Msg {msg_id} не в БД — сохранить не удалось")
+            logging.warning(f"Msg {msg_id} не в БД")
             continue
 
         (chat_id, message_id, user_id, bc, is_from_owner,
          text, content_type, file_id, caption, date) = row
 
-        header = f"🗑 Удалённое сообщение\n🕒 {date}"
+        if is_from_owner:
+            # Удалил владелец → уведомляем собеседника через бизнес-чат
+            target_id = chat_id
+            target_bc = bc_id
+            header = f"🗑 Собеседник удалил сообщение\n🕒 {date}"
+            logging.info(f"→ Удалил ВЛАДЕЛЕЦ. Шлём СОБЕСЕДНИКУ {target_id}")
+        else:
+            # Удалил собеседник → уведомляем владельца в личку с ботом
+            target_id = business_owner_id
+            target_bc = None
+            header = f"🗑 Ваш собеседник удалил сообщение\n🕒 {date}"
+            logging.info(f"→ Удалил СОБЕСЕДНИК. Шлём ВЛАДЕЛЬЦУ {target_id}")
 
-        # 1) Клиенту (собеседнику) — от имени бизнеса
         try:
             await send_copy(
-                chat_id=chat_id,
-                business_connection_id=bc_id,
+                chat_id=target_id,
+                business_connection_id=target_bc,
                 header=header,
                 text=text, content_type=content_type,
                 file_id=file_id, caption=caption
             )
-            logging.info(f"→ Отправлено СОБЕСЕДНИКУ {chat_id}")
+            logging.info(f"✅ Отправлено {target_id}")
         except Exception as e:
-            logging.error(f"Send error → собеседник {chat_id}: {e}")
-
-        # 2) Владельцу бизнеса — в личку с ботом
-        try:
-            await send_copy(
-                chat_id=business_owner_id,
-                business_connection_id=None,
-                header=header,
-                text=text, content_type=content_type,
-                file_id=file_id, caption=caption
-            )
-            logging.info(f"→ Отправлено ВЛАДЕЛЬЦУ {business_owner_id}")
-        except Exception as e:
-            logging.error(f"Send error → владелец {business_owner_id}: {e}")
+            logging.error(f"Send error (target={target_id}): {e}")
 
         delete_message(event.chat.id, msg_id)
 
@@ -311,7 +309,7 @@ async def main():
         format="%(asctime)s [%(levelname)s] %(message)s"
     )
     init_db()
-    logging.info(f"🚀 Бот запущен, ADMIN_CHAT_ID={ADMIN_CHAT_ID}")
+    logging.info(f"🚀 Бот запущен")
     asyncio.create_task(git_sync_loop())
     asyncio.create_task(periodic_cleanup())
     await dp.start_polling(
