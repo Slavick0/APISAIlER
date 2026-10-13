@@ -46,12 +46,10 @@ def init_db():
             PRIMARY KEY (chat_id, message_id)
         )
     """)
-    # Миграция: если старой колонки is_from_owner нет — добавим
     try:
         cursor.execute("ALTER TABLE messages ADD COLUMN is_from_owner INTEGER DEFAULT 0")
-        logging.info("🔧 Добавлена колонка is_from_owner")
     except sqlite3.OperationalError:
-        pass  # уже есть
+        pass
     conn.commit()
     conn.close()
 
@@ -181,7 +179,7 @@ async def cmd_start(message: types.Message):
     await message.answer(
         "👋 Бот отслеживает удалённые сообщения в Telegram Business.\n\n"
         "Подключите меня в Настройках → Telegram Business → Чат-боты.\n\n"
-        "Если один участник удалит сообщение — второй получит его текст."
+        "Если кто-то удалит сообщение — оба участника получат его текст."
     )
 
 
@@ -194,7 +192,6 @@ async def on_business_connection(connection: types.BusinessConnection):
 
 @dp.business_message()
 async def on_business_message(message: types.Message):
-    """Сохраняем каждое входящее сообщение и запоминаем, кто автор."""
     try:
         bc_id = getattr(message, "business_connection_id", None)
         business_owner_id = get_connection_owner(bc_id)
@@ -220,62 +217,80 @@ async def on_edited_business_message(message: types.Message):
         logging.error(f"Edit error: {e}")
 
 
+async def send_copy(chat_id: int, business_connection_id: str | None, header: str,
+                    text: str, content_type: str, file_id: str | None, caption: str):
+    """Универсальная отправка копии сообщения."""
+    kwargs = {"chat_id": chat_id}
+    if business_connection_id:
+        kwargs["business_connection_id"] = business_connection_id
+
+    if text:
+        await bot.send_message(text=f"{header}\n\n💬 {text}", **kwargs)
+    elif content_type == "photo" and file_id:
+        await bot.send_photo(photo=file_id, caption=f"{header}\n📷 {caption}", **kwargs)
+    elif content_type == "video" and file_id:
+        await bot.send_video(video=file_id, caption=f"{header}\n🎥 {caption}", **kwargs)
+    elif content_type == "document" and file_id:
+        await bot.send_document(document=file_id, caption=f"{header}\n📄 {caption}", **kwargs)
+    elif content_type == "voice" and file_id:
+        await bot.send_voice(voice=file_id, caption=header, **kwargs)
+    elif content_type == "audio" and file_id:
+        await bot.send_audio(audio=file_id, caption=f"{header}\n🎵 {caption}", **kwargs)
+    elif content_type == "sticker" and file_id:
+        await bot.send_sticker(sticker=file_id, **kwargs)
+        await bot.send_message(text=header, **kwargs)
+    elif content_type == "video_note" and file_id:
+        await bot.send_video_note(video_note=file_id, **kwargs)
+        await bot.send_message(text=header, **kwargs)
+    else:
+        await bot.send_message(text=f"{header}\n⚠️ {content_type}", **kwargs)
+
+
 @dp.deleted_business_messages()
 async def on_deleted_business_messages(event: types.BusinessMessagesDeleted):
-    """Удалил один — уведомление другому."""
+    """Уведомление уходит ОБОИМ участникам переписки."""
     bc_id = getattr(event, "business_connection_id", None)
+    business_owner_id = get_connection_owner(bc_id) or ADMIN_CHAT_ID
+
     logging.info(f"🗑 Удалено {len(event.message_ids)} в чате {event.chat.id}")
 
     for msg_id in event.message_ids:
         row = get_message(event.chat.id, msg_id)
 
         if not row:
-            logging.warning(f"Msg {msg_id} не в БД")
+            logging.warning(f"Msg {msg_id} не в БД — сохранить не удалось")
             continue
 
         (chat_id, message_id, user_id, bc, is_from_owner,
          text, content_type, file_id, caption, date) = row
 
-        if is_from_owner:
-            # Удалил хозяин бизнеса → шлём собеседнику (в чат с бизнесом)
-            target_id = chat_id
-            use_business = True
-            logging.info(f"→ Шлём СОБЕСЕДНИКУ {target_id} (удалил хозяин)")
-        else:
-            # Удалил собеседник → шлём хозяину (в личку с ботом)
-            target_id = ADMIN_CHAT_ID
-            use_business = False
-            logging.info(f"→ Шлём ХОЗЯИНУ {target_id} (удалил собеседник)")
+        header = f"🗑 Удалённое сообщение\n🕒 {date}"
 
-        header = f"🗑 Собеседник удалил сообщение\n🕒 {date}"
-
+        # 1) Клиенту (собеседнику) — от имени бизнеса
         try:
-            kwargs = {"chat_id": target_id}
-            if use_business and bc_id:
-                kwargs["business_connection_id"] = bc_id
-
-            if text:
-                await bot.send_message(text=f"{header}\n\n💬 {text}", **kwargs)
-            elif content_type == "photo" and file_id:
-                await bot.send_photo(photo=file_id, caption=f"{header}\n📷 {caption}", **kwargs)
-            elif content_type == "video" and file_id:
-                await bot.send_video(video=file_id, caption=f"{header}\n🎥 {caption}", **kwargs)
-            elif content_type == "document" and file_id:
-                await bot.send_document(document=file_id, caption=f"{header}\n📄 {caption}", **kwargs)
-            elif content_type == "voice" and file_id:
-                await bot.send_voice(voice=file_id, caption=header, **kwargs)
-            elif content_type == "audio" and file_id:
-                await bot.send_audio(audio=file_id, caption=f"{header}\n🎵 {caption}", **kwargs)
-            elif content_type == "sticker" and file_id:
-                await bot.send_sticker(sticker=file_id, **kwargs)
-                await bot.send_message(text=header, **kwargs)
-            elif content_type == "video_note" and file_id:
-                await bot.send_video_note(video_note=file_id, **kwargs)
-                await bot.send_message(text=header, **kwargs)
-            else:
-                await bot.send_message(text=f"{header}\n⚠️ {content_type}", **kwargs)
+            await send_copy(
+                chat_id=chat_id,
+                business_connection_id=bc_id,
+                header=header,
+                text=text, content_type=content_type,
+                file_id=file_id, caption=caption
+            )
+            logging.info(f"→ Отправлено СОБЕСЕДНИКУ {chat_id}")
         except Exception as e:
-            logging.error(f"Send error (target={target_id}): {e}")
+            logging.error(f"Send error → собеседник {chat_id}: {e}")
+
+        # 2) Владельцу бизнеса — в личку с ботом
+        try:
+            await send_copy(
+                chat_id=business_owner_id,
+                business_connection_id=None,
+                header=header,
+                text=text, content_type=content_type,
+                file_id=file_id, caption=caption
+            )
+            logging.info(f"→ Отправлено ВЛАДЕЛЬЦУ {business_owner_id}")
+        except Exception as e:
+            logging.error(f"Send error → владелец {business_owner_id}: {e}")
 
         delete_message(event.chat.id, msg_id)
 
