@@ -9,7 +9,7 @@ from datetime import datetime
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart
 
-# Токен и админ берём ТОЛЬКО из секретов GitHub (в коде их нет!)
+# Токен и ID владельца берём ТОЛЬКО из секретов GitHub
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
 
@@ -117,7 +117,7 @@ def cleanup_old_messages(days: int = 3):
 # --- СИНХРОНИЗАЦИЯ С GITHUB ---
 
 async def git_sync_loop():
-    """Каждую минуту коммитим БД в репозиторий."""
+    """Каждую минуту коммитим БД в репозиторий, чтобы не терять данные."""
     while True:
         await asyncio.sleep(60)
         try:
@@ -157,15 +157,18 @@ async def on_business_connection(connection: types.BusinessConnection):
 
 @dp.business_message()
 async def on_business_message(message: types.Message):
+    """Сохраняем каждое входящее сообщение."""
     try:
         bc_id = getattr(message, "business_connection_id", None)
         save_message(message, bc_id)
+        logging.info(f"💾 Сохранено msg {message.message_id} из чата {message.chat.id}")
     except Exception as e:
         logging.error(f"Save error: {e}")
 
 
 @dp.edited_business_message()
 async def on_edited_business_message(message: types.Message):
+    """Обновляем, если сообщение отредактировали."""
     try:
         bc_id = getattr(message, "business_connection_id", None)
         save_message(message, bc_id)
@@ -175,7 +178,7 @@ async def on_edited_business_message(message: types.Message):
 
 @dp.deleted_business_messages()
 async def on_deleted_business_messages(event: types.BusinessMessagesDeleted):
-    """Все удалённые сообщения шлём в ЛИЧКУ С БОТОМ (ADMIN_CHAT_ID)."""
+    """Удалённое сообщение шлём в ЛИЧКУ С БОТОМ (ADMIN_CHAT_ID)."""
     logging.info(f"🗑 Удалено {len(event.message_ids)} в чате {event.chat.id}")
 
     for msg_id in event.message_ids:
@@ -184,7 +187,8 @@ async def on_deleted_business_messages(event: types.BusinessMessagesDeleted):
         if not row:
             await bot.send_message(
                 ADMIN_CHAT_ID,
-                f"🗑 В чате {event.chat.id} удалено сообщение (ID {msg_id}), но текст не сохранён."
+                f"🗑 В чате {event.chat.id} удалено сообщение (ID {msg_id}), "
+                f"но текст не сохранён (пришло раньше запуска бота)."
             )
             continue
 
@@ -220,6 +224,7 @@ async def on_deleted_business_messages(event: types.BusinessMessagesDeleted):
 
 
 async def periodic_cleanup():
+    """Раз в сутки чистим старую БД."""
     while True:
         await asyncio.sleep(86400)
         try:
@@ -229,8 +234,11 @@ async def periodic_cleanup():
 
 
 async def main():
-    logging.basicConfig(level=logging.INFO, stream=sys.stdout,
-                        format="%(asctime)s [%(levelname)s] %(message)s")
+    logging.basicConfig(
+        level=logging.INFO,
+        stream=sys.stdout,
+        format="%(asctime)s [%(levelname)s] %(message)s"
+    )
     init_db()
     logging.info(f"🚀 Бот запущен, ADMIN_CHAT_ID={ADMIN_CHAT_ID}")
     asyncio.create_task(git_sync_loop())
