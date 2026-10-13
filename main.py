@@ -46,6 +46,12 @@ def init_db():
             PRIMARY KEY (chat_id, message_id)
         )
     """)
+    # Миграция: если старой колонки is_from_owner нет — добавим
+    try:
+        cursor.execute("ALTER TABLE messages ADD COLUMN is_from_owner INTEGER DEFAULT 0")
+        logging.info("🔧 Добавлена колонка is_from_owner")
+    except sqlite3.OperationalError:
+        pass  # уже есть
     conn.commit()
     conn.close()
 
