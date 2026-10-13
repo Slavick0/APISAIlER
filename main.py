@@ -9,8 +9,14 @@ from datetime import datetime
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "СЮДА_НОВЫЙ_ТОКЕН")
-FALLBACK_ADMIN_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
+# Токен и админ берём ТОЛЬКО из секретов GitHub (в коде их нет!)
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
+
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN не задан в Secrets!")
+if not ADMIN_CHAT_ID:
+    raise ValueError("ADMIN_CHAT_ID не задан в Secrets!")
 
 DB_PATH = "messages.db"
 
@@ -20,14 +26,6 @@ DB_PATH = "messages.db"
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS connections (
-            connection_id TEXT PRIMARY KEY,
-            owner_user_id INTEGER,
-            owner_username TEXT,
-            connected_at TEXT
-        )
-    """)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS messages (
             chat_id INTEGER,
@@ -45,29 +43,6 @@ def init_db():
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_bc ON messages(business_connection_id)")
     conn.commit()
     conn.close()
-
-
-def save_connection(conn_id: str, user_id: int, username: str):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("""
-        INSERT OR REPLACE INTO connections (connection_id, owner_user_id, owner_username, connected_at)
-        VALUES (?, ?, ?, ?)
-    """, (conn_id, user_id, username or "", datetime.now().isoformat()))
-    conn.commit()
-    conn.close()
-
-
-def get_connection_owner(conn_id: str):
-    """Возвращает user_id владельца бизнес-аккаунта по connection_id."""
-    if not conn_id:
-        return None
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT owner_user_id FROM connections WHERE connection_id = ?", (conn_id,))
-    row = cursor.fetchone()
-    conn.close()
-    return row[0] if row else None
 
 
 def save_message(message: types.Message, business_connection_id: str):
@@ -171,24 +146,13 @@ async def cmd_start(message: types.Message):
     await message.answer(
         "👋 Бот отслеживает удалённые сообщения в Telegram Business.\n\n"
         "Подключите меня в Настройках → Telegram Business → Чат-боты.\n"
-        "После подключения: если клиент удалит сообщение, я пришлю вам его в этот чат."
+        "После подключения все удалённые сообщения будут приходить сюда."
     )
 
 
 @dp.business_connection()
 async def on_business_connection(connection: types.BusinessConnection):
-    owner = connection.user
-    save_connection(connection.id, owner.id, owner.username or "")
-    logging.info(f"🔌 Business подключён: {connection.id} → user {owner.id} (@{owner.username})")
-
-    try:
-        await bot.send_message(
-            owner.id,
-            "✅ Бот подключён к вашему бизнес-аккаунту.\n"
-            "Теперь все удалённые сообщения будут приходить сюда."
-        )
-    except Exception as e:
-        logging.error(f"Не удалось уведомить владельца: {e}")
+    logging.info(f"🔌 Business подключён: {connection.id} → user {connection.user.id}")
 
 
 @dp.business_message()
@@ -211,26 +175,15 @@ async def on_edited_business_message(message: types.Message):
 
 @dp.deleted_business_messages()
 async def on_deleted_business_messages(event: types.BusinessMessagesDeleted):
-    """Шлём удалённое сообщение владельцу бизнес-аккаунта в личку с ботом."""
-    bc_id = getattr(event, "business_connection_id", None)
-
-    # Ищем владельца бизнес-соединения
-    owner_id = get_connection_owner(bc_id) if bc_id else None
-    if not owner_id:
-        owner_id = FALLBACK_ADMIN_ID
-
-    if not owner_id:
-        logging.warning(f"Не нашли владельца для bc={bc_id}")
-        return
-
-    logging.info(f"🗑 Удалено {len(event.message_ids)} в чате {event.chat.id}, шлём {owner_id}")
+    """Все удалённые сообщения шлём в ЛИЧКУ С БОТОМ (ADMIN_CHAT_ID)."""
+    logging.info(f"🗑 Удалено {len(event.message_ids)} в чате {event.chat.id}")
 
     for msg_id in event.message_ids:
         row = get_message(event.chat.id, msg_id)
 
         if not row:
             await bot.send_message(
-                owner_id,
+                ADMIN_CHAT_ID,
                 f"🗑 В чате {event.chat.id} удалено сообщение (ID {msg_id}), но текст не сохранён."
             )
             continue
@@ -240,27 +193,26 @@ async def on_deleted_business_messages(event: types.BusinessMessagesDeleted):
         header = f"🗑 Удалено\n💬 Чат: {chat_id}\n🆔 От: {user_id}\n🕒 {date}"
 
         try:
-            # ВАЖНО: без business_connection_id — сообщение уйдёт в ЛИЧКУ С БОТОМ
             if text:
-                await bot.send_message(owner_id, f"{header}\n\n💬 {text}")
+                await bot.send_message(ADMIN_CHAT_ID, f"{header}\n\n💬 {text}")
             elif content_type == "photo" and file_id:
-                await bot.send_photo(owner_id, file_id, caption=f"{header}\n📷 {caption}")
+                await bot.send_photo(ADMIN_CHAT_ID, file_id, caption=f"{header}\n📷 {caption}")
             elif content_type == "video" and file_id:
-                await bot.send_video(owner_id, file_id, caption=f"{header}\n🎥 {caption}")
+                await bot.send_video(ADMIN_CHAT_ID, file_id, caption=f"{header}\n🎥 {caption}")
             elif content_type == "document" and file_id:
-                await bot.send_document(owner_id, file_id, caption=f"{header}\n📄 {caption}")
+                await bot.send_document(ADMIN_CHAT_ID, file_id, caption=f"{header}\n📄 {caption}")
             elif content_type == "voice" and file_id:
-                await bot.send_voice(owner_id, file_id, caption=header)
+                await bot.send_voice(ADMIN_CHAT_ID, file_id, caption=header)
             elif content_type == "audio" and file_id:
-                await bot.send_audio(owner_id, file_id, caption=f"{header}\n🎵 {caption}")
+                await bot.send_audio(ADMIN_CHAT_ID, file_id, caption=f"{header}\n🎵 {caption}")
             elif content_type == "sticker" and file_id:
-                await bot.send_sticker(owner_id, file_id)
-                await bot.send_message(owner_id, header)
+                await bot.send_sticker(ADMIN_CHAT_ID, file_id)
+                await bot.send_message(ADMIN_CHAT_ID, header)
             elif content_type == "video_note" and file_id:
-                await bot.send_video_note(owner_id, file_id)
-                await bot.send_message(owner_id, header)
+                await bot.send_video_note(ADMIN_CHAT_ID, file_id)
+                await bot.send_message(ADMIN_CHAT_ID, header)
             else:
-                await bot.send_message(owner_id, f"{header}\n⚠️ {content_type}")
+                await bot.send_message(ADMIN_CHAT_ID, f"{header}\n⚠️ {content_type}")
         except Exception as e:
             logging.error(f"Send error: {e}")
 
@@ -280,10 +232,14 @@ async def main():
     logging.basicConfig(level=logging.INFO, stream=sys.stdout,
                         format="%(asctime)s [%(levelname)s] %(message)s")
     init_db()
-    logging.info("🚀 Бот запущен")
+    logging.info(f"🚀 Бот запущен, ADMIN_CHAT_ID={ADMIN_CHAT_ID}")
     asyncio.create_task(git_sync_loop())
     asyncio.create_task(periodic_cleanup())
-    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    await dp.start_polling(
+        bot,
+        allowed_updates=dp.resolve_used_update_types(),
+        drop_pending_updates=True
+    )
 
 
 if __name__ == "__main__":
