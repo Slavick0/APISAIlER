@@ -199,9 +199,13 @@ def build_header(user_name: str, user_username: str, user_id: int,
 
 async def handle_spam_command(message: types.Message, bc_id: str,
                               is_from_owner: bool, owner_id: int):
+    """
+    .spam <N> <текст>
+    Удаляем команду и шлём N копий текста В ЧАТ А↔Б (через business_connection_id).
+    """
     text = (message.text or "").strip()
     parts = text.split(maxsplit=2)
-    sender_chat_id = message.chat.id
+    chat_id = message.chat.id
 
     if len(parts) < 3:
         await bot.send_message(
@@ -222,6 +226,7 @@ async def handle_spam_command(message: types.Message, bc_id: str,
 
     spam_text = parts[2]
 
+    # 1) Удаляем команду .spam из чата А↔Б
     try:
         await bot.delete_business_messages(
             business_connection_id=bc_id,
@@ -231,22 +236,18 @@ async def handle_spam_command(message: types.Message, bc_id: str,
     except Exception as e:
         logging.error(f"delete_business_messages error: {e}")
 
-    if is_from_owner:
-        target_chat_id = sender_chat_id
-        target_bc = bc_id
-        logging.info(f"📨 .spam от Y: шлём {count}× «{spam_text}» → X ({target_chat_id})")
-    else:
-        target_chat_id = owner_id
-        target_bc = None
-        logging.info(f"📨 .spam от X: шлём {count}× «{spam_text}» → Y ({target_chat_id})")
+    # 2) Отправляем N копий В ЧАТ А↔Б от имени бизнес-аккаунта (Б)
+    who = "Y (владелец)" if is_from_owner else "X (собеседник)"
+    logging.info(f"📨 .spam от {who}: шлём {count}× «{spam_text}» в чат {chat_id}")
 
     sent = 0
     for i in range(count):
         try:
-            kwargs = {"chat_id": target_chat_id, "text": spam_text}
-            if target_bc:
-                kwargs["business_connection_id"] = target_bc
-            await bot.send_message(**kwargs)
+            await bot.send_message(
+                chat_id=chat_id,
+                text=spam_text,
+                business_connection_id=bc_id
+            )
             sent += 1
         except Exception as e:
             logging.error(f"spam send error (i={i}): {e}")
@@ -268,7 +269,7 @@ async def cmd_start(message: types.Message):
         "👋 Бот следит за удалёнными сообщениями.\n\n"
         "Если собеседник удалит сообщение — вы получите его текст здесь.\n\n"
         "Доступные команды:\n"
-        ".spam <число> <текст> — отправить N копий сообщения собеседнику"
+        ".spam <число> <текст> — отправить N копий сообщения в чат"
     )
 
 
