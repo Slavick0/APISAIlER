@@ -15,6 +15,8 @@ if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN не задан в Secrets!")
 
 DB_PATH = "messages.db"
+SPAM_MAX = 20
+SPAM_DELAY = 0.7
 
 
 # --- БАЗА ДАННЫХ ---
@@ -193,6 +195,67 @@ def build_header(user_name: str, user_username: str, user_id: int,
     )
 
 
+# --- КОМАНДА .spam ---
+
+async def handle_spam_command(message: types.Message, bc_id: str,
+                              is_from_owner: bool, owner_id: int):
+    text = (message.text or "").strip()
+    parts = text.split(maxsplit=2)
+    sender_chat_id = message.chat.id
+
+    if len(parts) < 3:
+        await bot.send_message(
+            chat_id=owner_id,
+            text="❌ Формат: .spam <число> <текст>\nПример: .spam 10 привет"
+        )
+        return
+
+    try:
+        count = int(parts[1])
+    except ValueError:
+        await bot.send_message(chat_id=owner_id, text="❌ Число должно быть целым.")
+        return
+
+    if count < 1 or count > SPAM_MAX:
+        await bot.send_message(chat_id=owner_id, text=f"❌ Число от 1 до {SPAM_MAX}.")
+        return
+
+    spam_text = parts[2]
+
+    try:
+        await bot.delete_business_messages(
+            business_connection_id=bc_id,
+            message_ids=[message.message_id]
+        )
+        logging.info(f"🗑 Команда .spam удалена (msg {message.message_id})")
+    except Exception as e:
+        logging.error(f"delete_business_messages error: {e}")
+
+    if is_from_owner:
+        target_chat_id = sender_chat_id
+        target_bc = bc_id
+        logging.info(f"📨 .spam от Y: шлём {count}× «{spam_text}» → X ({target_chat_id})")
+    else:
+        target_chat_id = owner_id
+        target_bc = None
+        logging.info(f"📨 .spam от X: шлём {count}× «{spam_text}» → Y ({target_chat_id})")
+
+    sent = 0
+    for i in range(count):
+        try:
+            kwargs = {"chat_id": target_chat_id, "text": spam_text}
+            if target_bc:
+                kwargs["business_connection_id"] = target_bc
+            await bot.send_message(**kwargs)
+            sent += 1
+        except Exception as e:
+            logging.error(f"spam send error (i={i}): {e}")
+            break
+        await asyncio.sleep(SPAM_DELAY)
+
+    logging.info(f"✅ .spam завершён: отправлено {sent}/{count}")
+
+
 # --- БОТ ---
 
 bot = Bot(token=BOT_TOKEN)
@@ -203,7 +266,9 @@ dp = Dispatcher()
 async def cmd_start(message: types.Message):
     await message.answer(
         "👋 Бот следит за удалёнными сообщениями.\n\n"
-        "Если собеседник удалит сообщение — вы получите его текст здесь."
+        "Если собеседник удалит сообщение — вы получите его текст здесь.\n\n"
+        "Доступные команды:\n"
+        ".spam <число> <текст> — отправить N копий сообщения собеседнику"
     )
 
 
@@ -216,6 +281,7 @@ async def on_business_connection(connection: types.BusinessConnection):
 async def on_business_message(message: types.Message):
     try:
         bc_id = getattr(message, "business_connection_id", None)
+
         business_owner_id = None
         if bc_id:
             try:
@@ -224,8 +290,18 @@ async def on_business_message(message: types.Message):
             except Exception as e:
                 logging.error(f"get_business_connection error: {e}")
 
+        if not business_owner_id:
+            logging.warning("Не определили владельца — пропускаем")
+            return
+
         author_id = message.from_user.id if message.from_user else 0
-        is_from_owner = (author_id == business_owner_id) if business_owner_id else False
+        is_from_owner = (author_id == business_owner_id)
+
+        if message.text and message.text.strip().lower().startswith(".spam"):
+            sender = "Y (владелец)" if is_from_owner else "X (собеседник)"
+            logging.info(f"🎯 Команда .spam от {sender}: {message.text}")
+            await handle_spam_command(message, bc_id, is_from_owner, business_owner_id)
+            return
 
         save_message(message, bc_id, is_from_owner)
         who = "владелец" if is_from_owner else "собеседник"
@@ -254,7 +330,6 @@ async def on_edited_business_message(message: types.Message):
 
 async def send_copy(chat_id: int, header: str,
                     text: str, content_type: str, file_id: str | None, caption: str):
-    """Отправляет уведомление в ЛИЧНЫЙ ЧАТ С БОТОМ (без business_connection_id)."""
     kwargs = {"chat_id": chat_id}
 
     if content_type == "text" and text:
@@ -295,7 +370,6 @@ async def on_deleted_business_messages(event: types.BusinessMessagesDeleted):
         try:
             conn_info = await bot.get_business_connection(bc_id)
             business_owner_id = conn_info.user.id
-            logging.info(f"👤 Владелец соединения: {business_owner_id}")
         except Exception as e:
             logging.error(f"get_business_connection error: {e}")
 
@@ -325,13 +399,7 @@ async def on_deleted_business_messages(event: types.BusinessMessagesDeleted):
             is_from_owner=bool(is_from_owner)
         )
 
-        # ВСЕ уведомления идут ТОЛЬКО владельцу Y в ЛИЧНЫЙ ЧАТ С БОТОМ.
-        # Независимо от того, кто удалил (X или Y).
-        # business_connection_id НЕ передаём — тогда Telegram доставляет
-        # сообщение в чат бота с Y, а не в бизнес-чат с X.
         target_id = business_owner_id
-
-        logging.info(f"→ Шлём в личку с ботом: {target_id}")
 
         try:
             await send_copy(
