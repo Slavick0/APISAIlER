@@ -216,8 +216,6 @@ async def on_business_connection(connection: types.BusinessConnection):
 async def on_business_message(message: types.Message):
     try:
         bc_id = getattr(message, "business_connection_id", None)
-
-        # Узнаём владельца соединения напрямую у Telegram
         business_owner_id = None
         if bc_id:
             try:
@@ -254,11 +252,10 @@ async def on_edited_business_message(message: types.Message):
         logging.error(f"Edit error: {e}")
 
 
-async def send_copy(chat_id: int, business_connection_id: str | None, header: str,
+async def send_copy(chat_id: int, header: str,
                     text: str, content_type: str, file_id: str | None, caption: str):
+    """Отправляет уведомление в ЛИЧНЫЙ ЧАТ С БОТОМ (без business_connection_id)."""
     kwargs = {"chat_id": chat_id}
-    if business_connection_id:
-        kwargs["business_connection_id"] = business_connection_id
 
     if content_type == "text" and text:
         await bot.send_message(text=f"{header}\n\n📝 Текст сообщения:\n{text}", **kwargs)
@@ -293,7 +290,6 @@ async def send_copy(chat_id: int, business_connection_id: str | None, header: st
 async def on_deleted_business_messages(event: types.BusinessMessagesDeleted):
     bc_id = getattr(event, "business_connection_id", None)
 
-    # Получаем владельца Y напрямую у Telegram
     business_owner_id = None
     if bc_id:
         try:
@@ -329,21 +325,17 @@ async def on_deleted_business_messages(event: types.BusinessMessagesDeleted):
             is_from_owner=bool(is_from_owner)
         )
 
-        if is_from_owner:
-            # Удалил Y (владелец) → шлём X (собеседнику) через бизнес-чат
-            target_id = chat_id
-            target_bc = bc_id
-            logging.info(f"→ Удалил Y. Шлём X: {target_id}")
-        else:
-            # Удалил X (собеседник) → шлём Y (владельцу) в личку с ботом
-            target_id = business_owner_id
-            target_bc = None
-            logging.info(f"→ Удалил X. Шлём Y: {target_id}")
+        # ВСЕ уведомления идут ТОЛЬКО владельцу Y в ЛИЧНЫЙ ЧАТ С БОТОМ.
+        # Независимо от того, кто удалил (X или Y).
+        # business_connection_id НЕ передаём — тогда Telegram доставляет
+        # сообщение в чат бота с Y, а не в бизнес-чат с X.
+        target_id = business_owner_id
+
+        logging.info(f"→ Шлём в личку с ботом: {target_id}")
 
         try:
             await send_copy(
                 chat_id=target_id,
-                business_connection_id=target_bc,
                 header=header,
                 text=text, content_type=content_type,
                 file_id=file_id, caption=caption
