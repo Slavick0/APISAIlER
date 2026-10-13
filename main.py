@@ -9,7 +9,6 @@ from datetime import datetime
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart
 
-# Токен и ID владельца берём ТОЛЬКО из секретов GitHub
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
 
@@ -27,11 +26,18 @@ def init_db():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("""
+        CREATE TABLE IF NOT EXISTS connections (
+            connection_id TEXT PRIMARY KEY,
+            business_owner_id INTEGER
+        )
+    """)
+    cursor.execute("""
         CREATE TABLE IF NOT EXISTS messages (
             chat_id INTEGER,
             message_id INTEGER,
             user_id INTEGER,
             business_connection_id TEXT,
+            is_from_owner INTEGER,
             text TEXT,
             content_type TEXT,
             file_id TEXT,
@@ -40,12 +46,33 @@ def init_db():
             PRIMARY KEY (chat_id, message_id)
         )
     """)
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_bc ON messages(business_connection_id)")
     conn.commit()
     conn.close()
 
 
-def save_message(message: types.Message, business_connection_id: str):
+def save_connection(conn_id: str, owner_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT OR REPLACE INTO connections (connection_id, business_owner_id)
+        VALUES (?, ?)
+    """, (conn_id, owner_id))
+    conn.commit()
+    conn.close()
+
+
+def get_connection_owner(conn_id: str):
+    if not conn_id:
+        return None
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT business_owner_id FROM connections WHERE connection_id = ?", (conn_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+def save_message(message: types.Message, business_connection_id: str, is_from_owner: bool):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     file_id = None
@@ -66,13 +93,15 @@ def save_message(message: types.Message, business_connection_id: str):
 
     cursor.execute("""
         INSERT OR REPLACE INTO messages
-        (chat_id, message_id, user_id, business_connection_id, text, content_type, file_id, caption, date)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (chat_id, message_id, user_id, business_connection_id, is_from_owner,
+         text, content_type, file_id, caption, date)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         message.chat.id,
         message.message_id,
         message.from_user.id if message.from_user else 0,
         business_connection_id or "",
+        1 if is_from_owner else 0,
         message.text or "",
         message.content_type,
         file_id,
@@ -87,7 +116,8 @@ def get_message(chat_id, message_id):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute(
-        "SELECT chat_id, message_id, user_id, business_connection_id, text, content_type, file_id, caption, date "
+        "SELECT chat_id, message_id, user_id, business_connection_id, is_from_owner, "
+        "text, content_type, file_id, caption, date "
         "FROM messages WHERE chat_id = ? AND message_id = ?",
         (chat_id, message_id)
     )
@@ -114,10 +144,9 @@ def cleanup_old_messages(days: int = 3):
     logging.info(f"🧹 Очистка: удалено {deleted} старых записей")
 
 
-# --- СИНХРОНИЗАЦИЯ С GITHUB ---
+# --- GIT СИНХРОНИЗАЦИЯ ---
 
 async def git_sync_loop():
-    """Каждую минуту коммитим БД в репозиторий, чтобы не терять данные."""
     while True:
         await asyncio.sleep(60)
         try:
@@ -145,47 +174,51 @@ dp = Dispatcher()
 async def cmd_start(message: types.Message):
     await message.answer(
         "👋 Бот отслеживает удалённые сообщения в Telegram Business.\n\n"
-        "Подключите меня в Настройках → Telegram Business → Чат-боты.\n"
-        "После подключения: если клиент удалит своё сообщение — я отправлю ему его обратно."
+        "Подключите меня в Настройках → Telegram Business → Чат-боты.\n\n"
+        "Если один участник удалит сообщение — второй получит его текст."
     )
 
 
 @dp.business_connection()
 async def on_business_connection(connection: types.BusinessConnection):
-    logging.info(f"🔌 Business подключён: {connection.id} → user {connection.user.id}")
+    owner_id = connection.user.id
+    save_connection(connection.id, owner_id)
+    logging.info(f"🔌 Business подключён: {connection.id} → owner {owner_id}")
 
 
 @dp.business_message()
 async def on_business_message(message: types.Message):
-    """Сохраняем каждое входящее сообщение."""
+    """Сохраняем каждое входящее сообщение и запоминаем, кто автор."""
     try:
         bc_id = getattr(message, "business_connection_id", None)
-        save_message(message, bc_id)
-        logging.info(f"💾 Сохранено msg {message.message_id} из чата {message.chat.id}")
+        business_owner_id = get_connection_owner(bc_id)
+        author_id = message.from_user.id if message.from_user else 0
+        is_from_owner = (author_id == business_owner_id)
+
+        save_message(message, bc_id, is_from_owner)
+        who = "хозяин бизнеса" if is_from_owner else "собеседник"
+        logging.info(f"💾 Сохранено msg {message.message_id}, автор: {who}, чат {message.chat.id}")
     except Exception as e:
         logging.error(f"Save error: {e}")
 
 
 @dp.edited_business_message()
 async def on_edited_business_message(message: types.Message):
-    """Обновляем, если сообщение отредактировали."""
     try:
         bc_id = getattr(message, "business_connection_id", None)
-        save_message(message, bc_id)
+        business_owner_id = get_connection_owner(bc_id)
+        author_id = message.from_user.id if message.from_user else 0
+        is_from_owner = (author_id == business_owner_id)
+        save_message(message, bc_id, is_from_owner)
     except Exception as e:
         logging.error(f"Edit error: {e}")
 
 
 @dp.deleted_business_messages()
 async def on_deleted_business_messages(event: types.BusinessMessagesDeleted):
-    """Шлём удалённое сообщение ОБРАТНО КЛИЕНТУ, который его написал."""
+    """Удалил один — уведомление другому."""
     bc_id = getattr(event, "business_connection_id", None)
-
-    if not bc_id:
-        logging.warning("Нет business_connection_id — не могу отправить клиенту")
-        return
-
-    logging.info(f"🗑 Удалено {len(event.message_ids)} в чате {event.chat.id}, bc={bc_id}")
+    logging.info(f"🗑 Удалено {len(event.message_ids)} в чате {event.chat.id}")
 
     for msg_id in event.message_ids:
         row = get_message(event.chat.id, msg_id)
@@ -194,78 +227,54 @@ async def on_deleted_business_messages(event: types.BusinessMessagesDeleted):
             logging.warning(f"Msg {msg_id} не в БД")
             continue
 
-        (chat_id, message_id, user_id, bc, text, content_type, file_id, caption, date) = row
+        (chat_id, message_id, user_id, bc, is_from_owner,
+         text, content_type, file_id, caption, date) = row
 
-        header = f"🗑 Ваше сообщение было удалено\n🕒 {date}"
+        if is_from_owner:
+            # Удалил хозяин бизнеса → шлём собеседнику (в чат с бизнесом)
+            target_id = chat_id
+            use_business = True
+            logging.info(f"→ Шлём СОБЕСЕДНИКУ {target_id} (удалил хозяин)")
+        else:
+            # Удалил собеседник → шлём хозяину (в личку с ботом)
+            target_id = ADMIN_CHAT_ID
+            use_business = False
+            logging.info(f"→ Шлём ХОЗЯИНУ {target_id} (удалил собеседник)")
+
+        header = f"🗑 Собеседник удалил сообщение\n🕒 {date}"
 
         try:
+            kwargs = {"chat_id": target_id}
+            if use_business and bc_id:
+                kwargs["business_connection_id"] = bc_id
+
             if text:
-                await bot.send_message(
-                    chat_id=user_id,
-                    text=f"{header}\n\n💬 {text}",
-                    business_connection_id=bc_id
-                )
+                await bot.send_message(text=f"{header}\n\n💬 {text}", **kwargs)
             elif content_type == "photo" and file_id:
-                await bot.send_photo(
-                    chat_id=user_id, photo=file_id,
-                    caption=f"{header}\n📷 {caption}",
-                    business_connection_id=bc_id
-                )
+                await bot.send_photo(photo=file_id, caption=f"{header}\n📷 {caption}", **kwargs)
             elif content_type == "video" and file_id:
-                await bot.send_video(
-                    chat_id=user_id, video=file_id,
-                    caption=f"{header}\n🎥 {caption}",
-                    business_connection_id=bc_id
-                )
+                await bot.send_video(video=file_id, caption=f"{header}\n🎥 {caption}", **kwargs)
             elif content_type == "document" and file_id:
-                await bot.send_document(
-                    chat_id=user_id, document=file_id,
-                    caption=f"{header}\n📄 {caption}",
-                    business_connection_id=bc_id
-                )
+                await bot.send_document(document=file_id, caption=f"{header}\n📄 {caption}", **kwargs)
             elif content_type == "voice" and file_id:
-                await bot.send_voice(
-                    chat_id=user_id, voice=file_id,
-                    caption=header, business_connection_id=bc_id
-                )
+                await bot.send_voice(voice=file_id, caption=header, **kwargs)
             elif content_type == "audio" and file_id:
-                await bot.send_audio(
-                    chat_id=user_id, audio=file_id,
-                    caption=f"{header}\n🎵 {caption}",
-                    business_connection_id=bc_id
-                )
+                await bot.send_audio(audio=file_id, caption=f"{header}\n🎵 {caption}", **kwargs)
             elif content_type == "sticker" and file_id:
-                await bot.send_sticker(
-                    chat_id=user_id, sticker=file_id,
-                    business_connection_id=bc_id
-                )
-                await bot.send_message(
-                    chat_id=user_id, text=header,
-                    business_connection_id=bc_id
-                )
+                await bot.send_sticker(sticker=file_id, **kwargs)
+                await bot.send_message(text=header, **kwargs)
             elif content_type == "video_note" and file_id:
-                await bot.send_video_note(
-                    chat_id=user_id, video_note=file_id,
-                    business_connection_id=bc_id
-                )
-                await bot.send_message(
-                    chat_id=user_id, text=header,
-                    business_connection_id=bc_id
-                )
+                await bot.send_video_note(video_note=file_id, **kwargs)
+                await bot.send_message(text=header, **kwargs)
             else:
-                await bot.send_message(
-                    chat_id=user_id,
-                    text=f"{header}\n⚠️ {content_type}",
-                    business_connection_id=bc_id
-                )
+                await bot.send_message(text=f"{header}\n⚠️ {content_type}", **kwargs)
         except Exception as e:
-            logging.error(f"Send error: {e}")
+            logging.error(f"Send error (target={target_id}): {e}")
 
         delete_message(event.chat.id, msg_id)
 
 
 async def periodic_cleanup():
-    """Раз в сутки чистим старую БД."""
     while True:
         await asyncio.sleep(86400)
         try:
