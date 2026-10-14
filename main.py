@@ -8,6 +8,7 @@ from datetime import datetime
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart
+from aiogram.methods import DeleteBusinessMessages
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
@@ -235,8 +236,6 @@ async def handle_spam_command(message: types.Message, bc_id: str,
     parts = text.split(maxsplit=2)
     chat_id = message.chat.id
 
-    # Отправляем только от имени того, кто написал команду.
-    # Если автор не владелец этого соединения — значит, это дубликат от другого соединения. Игнорируем.
     if not is_from_owner:
         logging.info(f"⚠️ .spam от не-владельца соединения — игнорируем (автор {message.from_user.id}, owner {owner_id})")
         return
@@ -260,14 +259,15 @@ async def handle_spam_command(message: types.Message, bc_id: str,
 
     spam_text = parts[2]
 
+    # Удаляем команду .spam из чата через НИЗКОУРОВНЕВЫЙ метод
     try:
-        await bot.delete_business_messages(
+        await bot(DeleteBusinessMessages(
             business_connection_id=bc_id,
             message_ids=[message.message_id]
-        )
+        ))
         logging.info(f"🗑 Команда .spam удалена (msg {message.message_id})")
     except Exception as e:
-        logging.error(f"delete_business_messages error: {e}")
+        logging.error(f"delete_business_messages error: {type(e).__name__}: {e}")
 
     logging.info(f"📨 .spam: шлём {count}× «{spam_text}» в чат {chat_id} через bc={bc_id}")
 
@@ -329,15 +329,14 @@ async def on_business_message(message: types.Message):
         author_id = message.from_user.id if message.from_user else 0
         is_from_owner = (author_id == business_owner_id)
 
-        # Обработка .spam
+        # Обработка .spam с защитой от дублирования
         if message.text and message.text.strip().lower().startswith(".spam"):
-            # ЗАЩИТА ОТ ДУБЛИРОВАНИЯ: если команда уже обработана — игнорируем
             if is_command_processed(message.chat.id, message.message_id):
                 logging.info(f"⚠️ .spam уже обработана (msg {message.message_id}) — игнорируем дубликат")
                 return
             mark_command_processed(message.chat.id, message.message_id)
 
-            sender = "Y (владелец)" if is_from_owner else "X (собеседник)"
+            sender = "владелец" if is_from_owner else "собеседник"
             logging.info(f"🎯 Команда .spam от {sender}: {message.text}")
             await handle_spam_command(message, bc_id, is_from_owner, business_owner_id)
             return
