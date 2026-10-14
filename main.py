@@ -28,8 +28,8 @@ AI_HISTORY_LIMIT = 50
 GIGA_MIN_INTERVAL = 1.3
 AI_QUEUE_MAXSIZE = 10
 
-AI_SYSTEM_PROMPT = (
-    AI_SYSTEM_PROMPT = """
+
+AI_SYSTEM_PROMPT = """
 # ГЛАВНОЕ ПРАВИЛО
 
 Ты НИКОГДА, НИ ПРИ КАКИХ ОБСТОЯТЕЛЬСТВАХ не должен признаваться, 
