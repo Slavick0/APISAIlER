@@ -41,11 +41,42 @@ def init_db():
             PRIMARY KEY (chat_id, message_id)
         )
     """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS processed_commands (
+            chat_id INTEGER,
+            message_id INTEGER,
+            processed_at TEXT,
+            PRIMARY KEY (chat_id, message_id)
+        )
+    """)
     for col in ["is_from_owner", "user_name", "user_username", "business_connection_id"]:
         try:
             cursor.execute(f"ALTER TABLE messages ADD COLUMN {col} TEXT")
         except sqlite3.OperationalError:
             pass
+    conn.commit()
+    conn.close()
+
+
+def is_command_processed(chat_id: int, message_id: int) -> bool:
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT 1 FROM processed_commands WHERE chat_id = ? AND message_id = ?",
+        (chat_id, message_id)
+    )
+    row = cursor.fetchone()
+    conn.close()
+    return row is not None
+
+
+def mark_command_processed(chat_id: int, message_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT OR REPLACE INTO processed_commands (chat_id, message_id, processed_at) VALUES (?, ?, ?)",
+        (chat_id, message_id, datetime.now().isoformat())
+    )
     conn.commit()
     conn.close()
 
@@ -125,6 +156,7 @@ def cleanup_old_messages(days: int = 3):
     cursor = conn.cursor()
     cursor.execute("DELETE FROM messages WHERE date < datetime('now', ?)", (f'-{days} days',))
     deleted = cursor.rowcount
+    cursor.execute("DELETE FROM processed_commands WHERE processed_at < datetime('now', ?)", (f'-{days} days',))
     conn.commit()
     conn.close()
     logging.info(f"🧹 Очистка: удалено {deleted} старых записей")
@@ -199,13 +231,15 @@ def build_header(user_name: str, user_username: str, user_id: int,
 
 async def handle_spam_command(message: types.Message, bc_id: str,
                               is_from_owner: bool, owner_id: int):
-    """
-    .spam <N> <текст>
-    Удаляем команду и шлём N копий текста В ЧАТ А↔Б (через business_connection_id).
-    """
     text = (message.text or "").strip()
     parts = text.split(maxsplit=2)
     chat_id = message.chat.id
+
+    # Отправляем только от имени того, кто написал команду.
+    # Если автор не владелец этого соединения — значит, это дубликат от другого соединения. Игнорируем.
+    if not is_from_owner:
+        logging.info(f"⚠️ .spam от не-владельца соединения — игнорируем (автор {message.from_user.id}, owner {owner_id})")
+        return
 
     if len(parts) < 3:
         await bot.send_message(
@@ -226,7 +260,6 @@ async def handle_spam_command(message: types.Message, bc_id: str,
 
     spam_text = parts[2]
 
-    # 1) Удаляем команду .spam из чата А↔Б
     try:
         await bot.delete_business_messages(
             business_connection_id=bc_id,
@@ -236,9 +269,7 @@ async def handle_spam_command(message: types.Message, bc_id: str,
     except Exception as e:
         logging.error(f"delete_business_messages error: {e}")
 
-    # 2) Отправляем N копий В ЧАТ А↔Б от имени бизнес-аккаунта (Б)
-    who = "Y (владелец)" if is_from_owner else "X (собеседник)"
-    logging.info(f"📨 .spam от {who}: шлём {count}× «{spam_text}» в чат {chat_id}")
+    logging.info(f"📨 .spam: шлём {count}× «{spam_text}» в чат {chat_id} через bc={bc_id}")
 
     sent = 0
     for i in range(count):
@@ -298,7 +329,14 @@ async def on_business_message(message: types.Message):
         author_id = message.from_user.id if message.from_user else 0
         is_from_owner = (author_id == business_owner_id)
 
+        # Обработка .spam
         if message.text and message.text.strip().lower().startswith(".spam"):
+            # ЗАЩИТА ОТ ДУБЛИРОВАНИЯ: если команда уже обработана — игнорируем
+            if is_command_processed(message.chat.id, message.message_id):
+                logging.info(f"⚠️ .spam уже обработана (msg {message.message_id}) — игнорируем дубликат")
+                return
+            mark_command_processed(message.chat.id, message.message_id)
+
             sender = "Y (владелец)" if is_from_owner else "X (собеседник)"
             logging.info(f"🎯 Команда .spam от {sender}: {message.text}")
             await handle_spam_command(message, bc_id, is_from_owner, business_owner_id)
