@@ -26,6 +26,7 @@ AI_ENABLED = True
 AI_MODEL = "GigaChat-2"
 AI_HISTORY_LIMIT = 50
 GIGA_MIN_INTERVAL = 1.3
+AI_QUEUE_MAXSIZE = 10
 
 AI_SYSTEM_PROMPT = (
     "Ты — живой человек, ведёшь личную переписку в Telegram. "
@@ -49,36 +50,27 @@ giga_client = GigaChat(
     ca_bundle_file=CERT_PATH if os.path.exists(CERT_PATH) else None
 )
 
-giga_lock = asyncio.Lock()
+# Очередь ИИ-запросов
+ai_queue: asyncio.Queue = None  # создадим в main()
 giga_last_call = 0.0
 
-# Кэш дедупликации: key = (sender_id, text, date_iso) -> timestamp
+# Кэш дедупликации
 DEDUP_CACHE = {}
-DEDUP_TTL = 30  # секунд
+DEDUP_TTL = 30
 
 
-def dedup_check_and_mark(sender_id: int, text: str, date_val) -> bool:
-    """
-    Возвращает True, если это ДУБЛИКАТ (уже обрабатывалось).
-    Иначе помечает как обработанное и возвращает False.
-    """
+def dedup_check_and_mark(sender_id, text, date_val):
     try:
         loop = asyncio.get_event_loop()
         now = loop.time()
     except Exception:
         now = 0
-
-    # Чистим старые записи
     for k in list(DEDUP_CACHE.keys()):
         if now - DEDUP_CACHE[k] > DEDUP_TTL:
             del DEDUP_CACHE[k]
-
-    date_str = str(date_val) if date_val else ""
-    key = (sender_id, text or "", date_str)
-
+    key = (sender_id, text or "", str(date_val) if date_val else "")
     if key in DEDUP_CACHE:
         return True
-
     DEDUP_CACHE[key] = now
     return False
 
@@ -327,51 +319,115 @@ def parse_date_time(date_str, time_str):
         return None
 
 
-# ==================== GIGACHAT ====================
+# ==================== GIGACHAT (низкоуровневый запрос) ====================
 
-async def get_ai_reply(chat_id, user_text):
+async def call_gigachat(chat_id, user_text):
+    """Низкоуровневый вызов GigaChat с retry на 429. Возвращает текст или None."""
     global giga_last_call
     if not AI_ENABLED or not giga_client:
         return None
 
-    async with giga_lock:
-        loop = asyncio.get_event_loop()
-        now = loop.time()
-        wait = GIGA_MIN_INTERVAL - (now - giga_last_call)
-        if wait > 0:
-            await asyncio.sleep(wait)
+    loop = asyncio.get_event_loop()
+    history = get_chat_history(chat_id, limit=AI_HISTORY_LIMIT)
+    messages = [Messages(role=MessagesRole.SYSTEM, content=AI_SYSTEM_PROMPT)]
+    for is_from_owner, text in history:
+        if not text:
+            continue
+        role = MessagesRole.ASSISTANT if is_from_owner else MessagesRole.USER
+        messages.append(Messages(role=role, content=text))
+    if not history or history[-1][1] != user_text:
+        messages.append(Messages(role=MessagesRole.USER, content=user_text))
 
-        history = get_chat_history(chat_id, limit=AI_HISTORY_LIMIT)
-        messages = [Messages(role=MessagesRole.SYSTEM, content=AI_SYSTEM_PROMPT)]
-        for is_from_owner, text in history:
-            if not text:
+    logging.info(f"🧠 GigaChat: {len(messages)} сообщений в контексте")
+
+    for attempt in range(4):
+        try:
+            response = await loop.run_in_executor(
+                None, lambda: giga_client.chat(Chat(messages=messages))
+            )
+            giga_last_call = loop.time()
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            err_text = str(e)
+            if "429" in err_text or "Too Many Requests" in err_text or "RateLimit" in type(e).__name__:
+                backoff = 2 ** attempt
+                logging.warning(f"⚠️ 429 от GigaChat, повтор через {backoff}с (попытка {attempt+1}/4)")
+                await asyncio.sleep(backoff)
                 continue
-            role = MessagesRole.ASSISTANT if is_from_owner else MessagesRole.USER
-            messages.append(Messages(role=role, content=text))
-        if not history or history[-1][1] != user_text:
-            messages.append(Messages(role=MessagesRole.USER, content=user_text))
+            logging.error(f"GigaChat API error: {type(e).__name__}: {e}")
+            return None
 
-        logging.info(f"🧠 GigaChat: {len(messages)} сообщений в контексте")
+    logging.error("❌ GigaChat: исчерпаны попытки после 429")
+    return None
 
-        for attempt in range(4):
-            try:
-                response = await loop.run_in_executor(
-                    None, lambda: giga_client.chat(Chat(messages=messages))
-                )
-                giga_last_call = loop.time()
-                return response.choices[0].message.content.strip()
-            except Exception as e:
-                err_text = str(e)
-                if "429" in err_text or "Too Many Requests" in err_text or "RateLimit" in type(e).__name__:
-                    backoff = 2 ** attempt
-                    logging.warning(f"⚠️ 429 от GigaChat, повтор через {backoff}с (попытка {attempt+1}/4)")
-                    await asyncio.sleep(backoff)
-                    continue
-                logging.error(f"GigaChat API error: {type(e).__name__}: {e}")
-                return None
 
-        logging.error("❌ GigaChat: исчерпаны попытки после 429")
-        return None
+# ==================== ОЧЕРЕДЬ ИИ ====================
+
+async def ai_worker():
+    """Один воркер, который последовательно обрабатывает очередь запросов."""
+    global giga_last_call
+    loop = asyncio.get_event_loop()
+
+    while True:
+        try:
+            item = await ai_queue.get()
+            chat_id = item["chat_id"]
+            user_text = item["user_text"]
+            bc_id = item["bc_id"]
+            owner_id = item["owner_id"]
+            need_reply_in_chat = item["need_reply_in_chat"]  # True для AI-режима
+
+            # Соблюдаем минимальный интервал
+            wait = GIGA_MIN_INTERVAL - (loop.time() - giga_last_call)
+            if wait > 0:
+                await asyncio.sleep(wait)
+
+            logging.info(f"📥 Очередь: обрабатываю запрос для чата {chat_id} (осталось {ai_queue.qsize()})")
+
+            reply = await call_gigachat(chat_id, user_text)
+
+            if reply:
+                try:
+                    if need_reply_in_chat:
+                        result = await bot.send_message(
+                            chat_id=chat_id, text=reply, business_connection_id=bc_id
+                        )
+                    else:
+                        result = await bot.send_message(chat_id=owner_id, text=reply)
+
+                    save_message(result, bc_id if need_reply_in_chat else "",
+                                 is_from_owner=True,
+                                 fallback_user_id=owner_id,
+                                 fallback_user_name="ИИ")
+                    logging.info(f"✅ Очередь: ответ отправлен в {chat_id}")
+                except Exception as e:
+                    logging.error(f"send queued reply error: {e}")
+            else:
+                logging.error(f"❌ Очередь: не удалось получить ответ для {chat_id}")
+
+            ai_queue.task_done()
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logging.error(f"ai_worker error: {e}")
+            await asyncio.sleep(1)
+
+
+def enqueue_ai_request(chat_id, user_text, bc_id, owner_id, need_reply_in_chat):
+    """Кладёт запрос в очередь. Возвращает False, если очередь переполнена."""
+    if ai_queue is None:
+        return False
+    if ai_queue.qsize() >= AI_QUEUE_MAXSIZE:
+        return False
+    ai_queue.put_nowait({
+        "chat_id": chat_id,
+        "user_text": user_text,
+        "bc_id": bc_id,
+        "owner_id": owner_id,
+        "need_reply_in_chat": need_reply_in_chat,
+    })
+    logging.info(f"📤 Запрос в очередь (размер {ai_queue.qsize()})")
+    return True
 
 
 # ==================== КОМАНДА .spam ====================
@@ -467,6 +523,7 @@ async def handle_ai_command(message, bc_id, owner_id):
             logging.error(f"ai on reply error: {e}")
         return
 
+    # Разовый запрос .ai <вопрос>
     prompt = text[3:].strip()
     if not prompt:
         await bot.send_message(chat_id=owner_id,
@@ -476,15 +533,14 @@ async def handle_ai_command(message, bc_id, owner_id):
         await bot(DeleteBusinessMessages(business_connection_id=bc_id, message_ids=[message.message_id]))
     except Exception as e:
         logging.error(f"delete .ai cmd error: {e}")
-    reply = await get_ai_reply(chat_id, prompt)
-    if not reply:
-        await bot.send_message(chat_id=owner_id, text="❌ ИИ недоступен (лимит или ошибка).")
-        return
-    try:
-        result = await bot.send_message(chat_id=chat_id, text=reply, business_connection_id=bc_id)
-        save_message(result, bc_id, is_from_owner=True, fallback_user_id=owner_id, fallback_user_name="Вы")
-    except Exception as e:
-        logging.error(f"send ai reply error: {e}")
+
+    # В очередь, ответ — в чат
+    ok = enqueue_ai_request(chat_id, prompt, bc_id, owner_id, need_reply_in_chat=True)
+    if not ok:
+        try:
+            await bot.send_message(chat_id=owner_id, text="⏳ Очередь переполнена, попробуй позже.")
+        except Exception:
+            pass
 
 
 # ==================== БОТ ====================
@@ -530,28 +586,23 @@ async def on_business_message(message: types.Message):
         text = (message.text or "").strip()
         chat_id = message.chat.id
 
-        # === ЗАЩИТА ОТ ДУБЛЕЙ (для случая, когда и А, и Б подключены к боту) ===
-        # Ключ: (отправитель, текст, дата) — одинаковый для обоих соединений
         is_duplicate = dedup_check_and_mark(author_id, text, message.date)
 
         # --- Команды ---
         if text.lower().startswith(".forget") or text.lower() == "забудь историю":
             if is_duplicate:
-                logging.info(f"⚠️ .forget: дубликат — пропускаем")
                 return
             await handle_forget_command(message, bc_id, business_owner_id)
             return
 
         if text.lower().startswith(".spam"):
             if is_duplicate:
-                logging.info(f"⚠️ .spam: дубликат — пропускаем")
                 return
             await handle_spam_command(message, bc_id, is_from_owner, business_owner_id)
             return
 
         if text.lower().startswith(".ai"):
             if is_duplicate:
-                logging.info(f"⚠️ .ai: дубликат — пропускаем")
                 return
             await handle_ai_command(message, bc_id, business_owner_id)
             return
@@ -561,21 +612,14 @@ async def on_business_message(message: types.Message):
                      fallback_user_id=business_owner_id, fallback_user_name="Вы")
         logging.info(f"💾 Сохранено msg {message.message_id}, автор: {'владелец' if is_from_owner else 'собеседник'}")
 
-        # --- AI-режим ---
+        # --- AI-режим: ставим в очередь ---
         if is_ai_mode_on(chat_id) and not is_from_owner and AI_ENABLED and text:
             if is_duplicate:
-                logging.info(f"⚠️ AI: дубликат сообщения (уже обрабатывалось) — пропускаем")
+                logging.info(f"⚠️ AI: дубликат — пропускаем")
                 return
-            logging.info(f"🤖 AI-режим: отвечаю собеседнику «{text[:60]}...»")
-            reply = await get_ai_reply(chat_id, text)
-            if reply:
-                try:
-                    result = await bot.send_message(chat_id=chat_id, text=reply, business_connection_id=bc_id)
-                    save_message(result, bc_id, is_from_owner=True,
-                                 fallback_user_id=business_owner_id, fallback_user_name="ИИ")
-                    logging.info(f"🤖 ИИ ответил: «{reply[:60]}...»")
-                except Exception as e:
-                    logging.error(f"send ai reply error: {e}")
+            ok = enqueue_ai_request(chat_id, text, bc_id, business_owner_id, need_reply_in_chat=True)
+            if not ok:
+                logging.warning(f"⚠️ Очередь переполнена, сообщение от {author_id} пропущено")
 
     except Exception as e:
         logging.error(f"business_message error: {e}")
@@ -652,7 +696,7 @@ async def on_deleted_business_messages(event: types.BusinessMessagesDeleted):
                 await bot.send_message(
                     chat_id=business_owner_id,
                     text=f"🗑 Удалено сообщение (ID: {msg_id}) в чате {event.chat.id}\n"
-                         f"⚠️ Текст недоступен — сообщение было отправлено до запуска бота."
+                         f"⚠️ Текст недоступен — отправлено до запуска бота."
                 )
             except Exception as e:
                 logging.error(f"notify missing msg error: {e}")
@@ -679,11 +723,15 @@ async def periodic_cleanup():
 
 
 async def main():
+    global ai_queue
     logging.basicConfig(level=logging.INFO, stream=sys.stdout,
                         format="%(asctime)s [%(levelname)s] %(message)s")
     init_db()
+    ai_queue = asyncio.Queue(maxsize=AI_QUEUE_MAXSIZE)
     logging.info(f"🚀 Бот запущен. ИИ (GigaChat): {'включён' if AI_ENABLED else 'выключен'}")
 
+    # Запускаем воркер очереди
+    asyncio.create_task(ai_worker())
     asyncio.create_task(git_sync_loop())
     asyncio.create_task(periodic_cleanup())
 
