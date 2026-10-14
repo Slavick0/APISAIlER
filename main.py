@@ -259,7 +259,6 @@ async def handle_spam_command(message: types.Message, bc_id: str,
 
     spam_text = parts[2]
 
-    # Удаляем команду .spam из чата через НИЗКОУРОВНЕВЫЙ метод
     try:
         await bot(DeleteBusinessMessages(
             business_connection_id=bc_id,
@@ -329,7 +328,6 @@ async def on_business_message(message: types.Message):
         author_id = message.from_user.id if message.from_user else 0
         is_from_owner = (author_id == business_owner_id)
 
-        # Обработка .spam с защитой от дублирования
         if message.text and message.text.strip().lower().startswith(".spam"):
             if is_command_processed(message.chat.id, message.message_id):
                 logging.info(f"⚠️ .spam уже обработана (msg {message.message_id}) — игнорируем дубликат")
@@ -402,12 +400,14 @@ async def send_copy(chat_id: int, header: str,
 @dp.deleted_business_messages()
 async def on_deleted_business_messages(event: types.BusinessMessagesDeleted):
     bc_id = getattr(event, "business_connection_id", None)
+    logging.info(f"🔔 Получено событие deleted_business_messages: chat={event.chat.id}, bc={bc_id}, ids={event.message_ids}")
 
     business_owner_id = None
     if bc_id:
         try:
             conn_info = await bot.get_business_connection(bc_id)
             business_owner_id = conn_info.user.id
+            logging.info(f"👤 Владелец соединения: {business_owner_id}")
         except Exception as e:
             logging.error(f"get_business_connection error: {e}")
 
@@ -415,13 +415,11 @@ async def on_deleted_business_messages(event: types.BusinessMessagesDeleted):
         logging.error("Не удалось определить владельца — пропускаем")
         return
 
-    logging.info(f"🗑 Удалено {len(event.message_ids)} в чате {event.chat.id}")
-
     for msg_id in event.message_ids:
         row = get_message(event.chat.id, msg_id)
 
         if not row:
-            logging.warning(f"Msg {msg_id} не в БД")
+            logging.warning(f"Msg {msg_id} не в БД — нечего пересылать")
             continue
 
         (chat_id, message_id, user_id, user_name, user_username,
@@ -470,11 +468,22 @@ async def main():
     )
     init_db()
     logging.info("🚀 Бот запущен")
+
     asyncio.create_task(git_sync_loop())
     asyncio.create_task(periodic_cleanup())
+
+    # ЯВНО перечисляем все нужные типы обновлений, включая business
     await dp.start_polling(
         bot,
-        allowed_updates=dp.resolve_used_update_types(),
+        allowed_updates=[
+            "message",
+            "edited_message",
+            "callback_query",
+            "business_connection",
+            "business_message",
+            "edited_business_message",
+            "deleted_business_messages",
+        ],
         drop_pending_updates=True
     )
 
