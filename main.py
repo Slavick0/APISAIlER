@@ -25,8 +25,6 @@ if not GIGACHAT_CREDENTIALS:
 AI_ENABLED = True
 AI_MODEL = "GigaChat-2"
 AI_HISTORY_LIMIT = 50
-
-# Минимальная пауза между запросами к GigaChat (free tier = 1 rps)
 GIGA_MIN_INTERVAL = 1.3
 
 AI_SYSTEM_PROMPT = (
@@ -51,9 +49,39 @@ giga_client = GigaChat(
     ca_bundle_file=CERT_PATH if os.path.exists(CERT_PATH) else None
 )
 
-# Семафор + таймер последнего запроса — чтобы не превышать 1 rps
 giga_lock = asyncio.Lock()
 giga_last_call = 0.0
+
+# Кэш дедупликации: key = (sender_id, text, date_iso) -> timestamp
+DEDUP_CACHE = {}
+DEDUP_TTL = 30  # секунд
+
+
+def dedup_check_and_mark(sender_id: int, text: str, date_val) -> bool:
+    """
+    Возвращает True, если это ДУБЛИКАТ (уже обрабатывалось).
+    Иначе помечает как обработанное и возвращает False.
+    """
+    try:
+        loop = asyncio.get_event_loop()
+        now = loop.time()
+    except Exception:
+        now = 0
+
+    # Чистим старые записи
+    for k in list(DEDUP_CACHE.keys()):
+        if now - DEDUP_CACHE[k] > DEDUP_TTL:
+            del DEDUP_CACHE[k]
+
+    date_str = str(date_val) if date_val else ""
+    key = (sender_id, text or "", date_str)
+
+    if key in DEDUP_CACHE:
+        return True
+
+    DEDUP_CACHE[key] = now
+    return False
+
 
 DB_PATH = "messages.db"
 SPAM_MAX = 20
@@ -67,40 +95,26 @@ def init_db():
     cursor = conn.cursor()
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS messages (
-            chat_id INTEGER,
-            message_id INTEGER,
-            user_id INTEGER,
-            user_name TEXT,
-            user_username TEXT,
-            business_connection_id TEXT,
-            is_from_owner INTEGER,
-            text TEXT,
-            content_type TEXT,
-            file_id TEXT,
-            caption TEXT,
-            date TEXT,
+            chat_id INTEGER, message_id INTEGER, user_id INTEGER, user_name TEXT,
+            user_username TEXT, business_connection_id TEXT, is_from_owner INTEGER,
+            text TEXT, content_type TEXT, file_id TEXT, caption TEXT, date TEXT,
             PRIMARY KEY (chat_id, message_id)
         )
     """)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS processed_commands (
-            chat_id INTEGER,
-            message_id INTEGER,
-            processed_at TEXT,
+            chat_id INTEGER, message_id INTEGER, processed_at TEXT,
             PRIMARY KEY (chat_id, message_id)
         )
     """)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS history_settings (
-            chat_id INTEGER PRIMARY KEY,
-            reset_at TEXT
+            chat_id INTEGER PRIMARY KEY, reset_at TEXT
         )
     """)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS ai_mode (
-            chat_id INTEGER PRIMARY KEY,
-            enabled INTEGER DEFAULT 0,
-            started_at TEXT
+            chat_id INTEGER PRIMARY KEY, enabled INTEGER DEFAULT 0, started_at TEXT
         )
     """)
     for col in ["is_from_owner", "user_name", "user_username", "business_connection_id"]:
@@ -313,16 +327,14 @@ def parse_date_time(date_str, time_str):
         return None
 
 
-# ==================== GIGACHAT (с очередью и retry) ====================
+# ==================== GIGACHAT ====================
 
 async def get_ai_reply(chat_id, user_text):
-    """Запрос к GigaChat с учётом лимита 1 rps и retry на 429."""
     global giga_last_call
     if not AI_ENABLED or not giga_client:
         return None
 
     async with giga_lock:
-        # Ждём, чтобы между запросами прошло не меньше GIGA_MIN_INTERVAL
         loop = asyncio.get_event_loop()
         now = loop.time()
         wait = GIGA_MIN_INTERVAL - (now - giga_last_call)
@@ -341,7 +353,6 @@ async def get_ai_reply(chat_id, user_text):
 
         logging.info(f"🧠 GigaChat: {len(messages)} сообщений в контексте")
 
-        # Retry на 429
         for attempt in range(4):
             try:
                 response = await loop.run_in_executor(
@@ -352,7 +363,7 @@ async def get_ai_reply(chat_id, user_text):
             except Exception as e:
                 err_text = str(e)
                 if "429" in err_text or "Too Many Requests" in err_text or "RateLimit" in type(e).__name__:
-                    backoff = 2 ** attempt  # 1, 2, 4, 8
+                    backoff = 2 ** attempt
                     logging.warning(f"⚠️ 429 от GigaChat, повтор через {backoff}с (попытка {attempt+1}/4)")
                     await asyncio.sleep(backoff)
                     continue
@@ -401,7 +412,7 @@ async def handle_spam_command(message, bc_id, is_from_owner, owner_id):
     logging.info(f"✅ .spam: отправлено {sent}/{count}")
 
 
-# ==================== КОМАНДА .forget ====================
+# ==================== .forget ====================
 
 async def handle_forget_command(message, bc_id, owner_id):
     chat_id = message.chat.id
@@ -417,13 +428,12 @@ async def handle_forget_command(message, bc_id, owner_id):
         logging.error(f"forget reply error: {e}")
 
 
-# ==================== КОМАНДА .ai ====================
+# ==================== .ai ====================
 
 async def handle_ai_command(message, bc_id, owner_id):
     text = (message.text or "").strip()
     chat_id = message.chat.id
 
-    # .ai off
     if re.match(r"^\.ai\s+off$", text, re.IGNORECASE):
         set_ai_mode(chat_id, False)
         try:
@@ -437,7 +447,6 @@ async def handle_ai_command(message, bc_id, owner_id):
             logging.error(f"ai off reply error: {e}")
         return
 
-    # .ai on <дата> <время>
     m = re.match(r"^\.ai\s+on\s+(\d{2}\.\d{2}\.\d{4})\s+(\d{2}:\d{2})$", text, re.IGNORECASE)
     if m:
         date_str, time_str = m.group(1), m.group(2)
@@ -458,7 +467,6 @@ async def handle_ai_command(message, bc_id, owner_id):
             logging.error(f"ai on reply error: {e}")
         return
 
-    # .ai <вопрос> — разовый запрос
     prompt = text[3:].strip()
     if not prompt:
         await bot.send_message(chat_id=owner_id,
@@ -522,22 +530,29 @@ async def on_business_message(message: types.Message):
         text = (message.text or "").strip()
         chat_id = message.chat.id
 
+        # === ЗАЩИТА ОТ ДУБЛЕЙ (для случая, когда и А, и Б подключены к боту) ===
+        # Ключ: (отправитель, текст, дата) — одинаковый для обоих соединений
+        is_duplicate = dedup_check_and_mark(author_id, text, message.date)
+
         # --- Команды ---
         if text.lower().startswith(".forget") or text.lower() == "забудь историю":
-            if is_command_processed(chat_id, message.message_id): return
-            mark_command_processed(chat_id, message.message_id)
+            if is_duplicate:
+                logging.info(f"⚠️ .forget: дубликат — пропускаем")
+                return
             await handle_forget_command(message, bc_id, business_owner_id)
             return
 
         if text.lower().startswith(".spam"):
-            if is_command_processed(chat_id, message.message_id): return
-            mark_command_processed(chat_id, message.message_id)
+            if is_duplicate:
+                logging.info(f"⚠️ .spam: дубликат — пропускаем")
+                return
             await handle_spam_command(message, bc_id, is_from_owner, business_owner_id)
             return
 
         if text.lower().startswith(".ai"):
-            if is_command_processed(chat_id, message.message_id): return
-            mark_command_processed(chat_id, message.message_id)
+            if is_duplicate:
+                logging.info(f"⚠️ .ai: дубликат — пропускаем")
+                return
             await handle_ai_command(message, bc_id, business_owner_id)
             return
 
@@ -546,8 +561,11 @@ async def on_business_message(message: types.Message):
                      fallback_user_id=business_owner_id, fallback_user_name="Вы")
         logging.info(f"💾 Сохранено msg {message.message_id}, автор: {'владелец' if is_from_owner else 'собеседник'}")
 
-        # --- AI-режим: отвечаем собеседнику ---
+        # --- AI-режим ---
         if is_ai_mode_on(chat_id) and not is_from_owner and AI_ENABLED and text:
+            if is_duplicate:
+                logging.info(f"⚠️ AI: дубликат сообщения (уже обрабатывалось) — пропускаем")
+                return
             logging.info(f"🤖 AI-режим: отвечаю собеседнику «{text[:60]}...»")
             reply = await get_ai_reply(chat_id, text)
             if reply:
@@ -629,8 +647,7 @@ async def on_deleted_business_messages(event: types.BusinessMessagesDeleted):
     for msg_id in event.message_ids:
         row = get_message(event.chat.id, msg_id)
         if not row:
-            # Сообщения нет в БД — скорее всего, было отправлено до запуска бота
-            logging.warning(f"Msg {msg_id} не в БД — вероятно, отправлено до запуска бота")
+            logging.warning(f"Msg {msg_id} не в БД")
             try:
                 await bot.send_message(
                     chat_id=business_owner_id,
@@ -640,7 +657,6 @@ async def on_deleted_business_messages(event: types.BusinessMessagesDeleted):
             except Exception as e:
                 logging.error(f"notify missing msg error: {e}")
             continue
-
         (chat_id, message_id, user_id, user_name, user_username,
          bc, is_from_owner, text, content_type, file_id, caption, date) = row
         header = build_header(user_name, user_username, user_id, chat_id,
