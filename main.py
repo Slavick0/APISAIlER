@@ -82,7 +82,9 @@ def mark_command_processed(chat_id: int, message_id: int):
     conn.close()
 
 
-def save_message(message: types.Message, business_connection_id: str, is_from_owner: bool):
+def save_message(message: types.Message, business_connection_id: str, is_from_owner: bool,
+                 fallback_user_id: int = 0, fallback_user_name: str = "Бот",
+                 fallback_user_username: str = ""):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     file_id = None
@@ -102,8 +104,14 @@ def save_message(message: types.Message, business_connection_id: str, is_from_ow
         file_id = message.video_note.file_id
 
     user = message.from_user
-    user_name = user.full_name if user else "Неизвестный"
-    user_username = (user.username if user and user.username else "")
+    if user:
+        user_id = user.id
+        user_name = user.full_name
+        user_username = user.username or ""
+    else:
+        user_id = fallback_user_id
+        user_name = fallback_user_name
+        user_username = fallback_user_username
 
     cursor.execute("""
         INSERT OR REPLACE INTO messages
@@ -114,7 +122,7 @@ def save_message(message: types.Message, business_connection_id: str, is_from_ow
     """, (
         message.chat.id,
         message.message_id,
-        user.id if user else 0,
+        user_id,
         user_name,
         user_username,
         business_connection_id or "",
@@ -259,6 +267,7 @@ async def handle_spam_command(message: types.Message, bc_id: str,
 
     spam_text = parts[2]
 
+    # Удаляем саму команду .spam из чата
     try:
         await bot(DeleteBusinessMessages(
             business_connection_id=bc_id,
@@ -273,11 +282,20 @@ async def handle_spam_command(message: types.Message, bc_id: str,
     sent = 0
     for i in range(count):
         try:
-            await bot.send_message(
+            result = await bot.send_message(
                 chat_id=chat_id,
                 text=spam_text,
                 business_connection_id=bc_id
             )
+            # Сохраняем отправленное сообщение, чтобы отследить его удаление
+            try:
+                save_message(result, bc_id, is_from_owner=True,
+                             fallback_user_id=owner_id,
+                             fallback_user_name="Вы",
+                             fallback_user_username="")
+                logging.info(f"💾 Сохранено отправленное msg {result.message_id}")
+            except Exception as se:
+                logging.error(f"save sent msg error: {se}")
             sent += 1
         except Exception as e:
             logging.error(f"spam send error (i={i}): {e}")
@@ -339,7 +357,9 @@ async def on_business_message(message: types.Message):
             await handle_spam_command(message, bc_id, is_from_owner, business_owner_id)
             return
 
-        save_message(message, bc_id, is_from_owner)
+        save_message(message, bc_id, is_from_owner,
+                     fallback_user_id=business_owner_id,
+                     fallback_user_name="Вы")
         who = "владелец" if is_from_owner else "собеседник"
         logging.info(f"💾 Сохранено msg {message.message_id}, автор: {who}, чат {message.chat.id}")
     except Exception as e:
@@ -359,7 +379,9 @@ async def on_edited_business_message(message: types.Message):
                 logging.error(f"get_business_connection error: {e}")
         author_id = message.from_user.id if message.from_user else 0
         is_from_owner = (author_id == business_owner_id) if business_owner_id else False
-        save_message(message, bc_id, is_from_owner)
+        save_message(message, bc_id, is_from_owner,
+                     fallback_user_id=business_owner_id or 0,
+                     fallback_user_name="Вы")
     except Exception as e:
         logging.error(f"Edit error: {e}")
 
@@ -472,7 +494,6 @@ async def main():
     asyncio.create_task(git_sync_loop())
     asyncio.create_task(periodic_cleanup())
 
-    # ЯВНО перечисляем все нужные типы обновлений, включая business
     await dp.start_polling(
         bot,
         allowed_updates=[
