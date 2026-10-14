@@ -26,6 +26,9 @@ AI_ENABLED = True
 AI_MODEL = "GigaChat-2"
 AI_HISTORY_LIMIT = 50
 
+# Минимальная пауза между запросами к GigaChat (free tier = 1 rps)
+GIGA_MIN_INTERVAL = 1.3
+
 AI_SYSTEM_PROMPT = (
     "Ты — живой человек, ведёшь личную переписку в Telegram. "
     "НИКОГДА не упоминай, что ты ИИ, бот, программа, ассистент, модель или GigaChat. "
@@ -47,6 +50,10 @@ giga_client = GigaChat(
     verify_ssl_certs=False,
     ca_bundle_file=CERT_PATH if os.path.exists(CERT_PATH) else None
 )
+
+# Семафор + таймер последнего запроса — чтобы не превышать 1 rps
+giga_lock = asyncio.Lock()
+giga_last_call = 0.0
 
 DB_PATH = "messages.db"
 SPAM_MAX = 20
@@ -105,7 +112,7 @@ def init_db():
     conn.close()
 
 
-def is_command_processed(chat_id: int, message_id: int) -> bool:
+def is_command_processed(chat_id, message_id):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("SELECT 1 FROM processed_commands WHERE chat_id = ? AND message_id = ?", (chat_id, message_id))
@@ -114,29 +121,24 @@ def is_command_processed(chat_id: int, message_id: int) -> bool:
     return row is not None
 
 
-def mark_command_processed(chat_id: int, message_id: int):
+def mark_command_processed(chat_id, message_id):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute(
-        "INSERT OR REPLACE INTO processed_commands (chat_id, message_id, processed_at) VALUES (?, ?, ?)",
-        (chat_id, message_id, datetime.now().isoformat())
-    )
+    cursor.execute("INSERT OR REPLACE INTO processed_commands (chat_id, message_id, processed_at) VALUES (?, ?, ?)",
+                   (chat_id, message_id, datetime.now().isoformat()))
     conn.commit()
     conn.close()
 
 
-def set_history_reset(chat_id: int, reset_at: str):
+def set_history_reset(chat_id, reset_at):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute(
-        "INSERT OR REPLACE INTO history_settings (chat_id, reset_at) VALUES (?, ?)",
-        (chat_id, reset_at)
-    )
+    cursor.execute("INSERT OR REPLACE INTO history_settings (chat_id, reset_at) VALUES (?, ?)", (chat_id, reset_at))
     conn.commit()
     conn.close()
 
 
-def get_history_reset(chat_id: int) -> str | None:
+def get_history_reset(chat_id):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("SELECT reset_at FROM history_settings WHERE chat_id = ?", (chat_id,))
@@ -145,24 +147,19 @@ def get_history_reset(chat_id: int) -> str | None:
     return row[0] if row else None
 
 
-def set_ai_mode(chat_id: int, enabled: bool):
+def set_ai_mode(chat_id, enabled):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     if enabled:
-        cursor.execute(
-            "INSERT OR REPLACE INTO ai_mode (chat_id, enabled, started_at) VALUES (?, 1, ?)",
-            (chat_id, datetime.now().isoformat())
-        )
+        cursor.execute("INSERT OR REPLACE INTO ai_mode (chat_id, enabled, started_at) VALUES (?, 1, ?)",
+                       (chat_id, datetime.now().isoformat()))
     else:
-        cursor.execute(
-            "INSERT OR REPLACE INTO ai_mode (chat_id, enabled, started_at) VALUES (?, 0, NULL)",
-            (chat_id,)
-        )
+        cursor.execute("INSERT OR REPLACE INTO ai_mode (chat_id, enabled, started_at) VALUES (?, 0, NULL)", (chat_id,))
     conn.commit()
     conn.close()
 
 
-def is_ai_mode_on(chat_id: int) -> bool:
+def is_ai_mode_on(chat_id):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("SELECT enabled FROM ai_mode WHERE chat_id = ?", (chat_id,))
@@ -171,7 +168,7 @@ def is_ai_mode_on(chat_id: int) -> bool:
     return bool(row and row[0])
 
 
-def get_chat_history(chat_id: int, limit: int = 50) -> list:
+def get_chat_history(chat_id, limit=50):
     reset_at = get_history_reset(chat_id)
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -192,9 +189,8 @@ def get_chat_history(chat_id: int, limit: int = 50) -> list:
     return rows
 
 
-def save_message(message: types.Message, business_connection_id: str, is_from_owner: bool,
-                 fallback_user_id: int = 0, fallback_user_name: str = "Бот",
-                 fallback_user_username: str = ""):
+def save_message(message, business_connection_id, is_from_owner,
+                 fallback_user_id=0, fallback_user_name="Бот", fallback_user_username=""):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     file_id = None
@@ -231,11 +227,8 @@ def get_message(chat_id, message_id):
     cursor = conn.cursor()
     cursor.execute(
         "SELECT chat_id, message_id, user_id, user_name, user_username, "
-        "business_connection_id, is_from_owner, "
-        "text, content_type, file_id, caption, date "
-        "FROM messages WHERE chat_id = ? AND message_id = ?",
-        (chat_id, message_id)
-    )
+        "business_connection_id, is_from_owner, text, content_type, file_id, caption, date "
+        "FROM messages WHERE chat_id = ? AND message_id = ?", (chat_id, message_id))
     row = cursor.fetchone()
     conn.close()
     return row
@@ -249,7 +242,7 @@ def delete_message(chat_id, message_id):
     conn.close()
 
 
-def cleanup_old_messages(days: int = 3):
+def cleanup_old_messages(days=3):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("DELETE FROM messages WHERE date < datetime('now', ?)", (f'-{days} days',))
@@ -280,7 +273,7 @@ async def git_sync_loop():
 
 # ==================== УТИЛИТЫ ====================
 
-def format_time(iso_date: str) -> str:
+def format_time(iso_date):
     try:
         dt = datetime.fromisoformat(iso_date)
         return dt.strftime("%d.%m.%Y | %H:%M:%S")
@@ -288,7 +281,7 @@ def format_time(iso_date: str) -> str:
         return iso_date
 
 
-def get_type_label(content_type: str) -> str:
+def get_type_label(content_type):
     labels = {"text": "текстовое сообщение", "photo": "фото", "video": "видео",
               "document": "документ", "voice": "голосовое сообщение", "audio": "аудио",
               "sticker": "стикер", "video_note": "видеосообщение", "animation": "GIF"}
@@ -312,7 +305,7 @@ def build_header(user_name, user_username, user_id, chat_id, date_iso, content_t
     )
 
 
-def parse_date_time(date_str: str, time_str: str):
+def parse_date_time(date_str, time_str):
     try:
         dt = datetime.strptime(f"{date_str} {time_str}", "%d.%m.%Y %H:%M")
         return dt.isoformat()
@@ -320,12 +313,22 @@ def parse_date_time(date_str: str, time_str: str):
         return None
 
 
-# ==================== GIGACHAT ====================
+# ==================== GIGACHAT (с очередью и retry) ====================
 
-async def get_ai_reply(chat_id: int, user_text: str) -> str | None:
+async def get_ai_reply(chat_id, user_text):
+    """Запрос к GigaChat с учётом лимита 1 rps и retry на 429."""
+    global giga_last_call
     if not AI_ENABLED or not giga_client:
         return None
-    try:
+
+    async with giga_lock:
+        # Ждём, чтобы между запросами прошло не меньше GIGA_MIN_INTERVAL
+        loop = asyncio.get_event_loop()
+        now = loop.time()
+        wait = GIGA_MIN_INTERVAL - (now - giga_last_call)
+        if wait > 0:
+            await asyncio.sleep(wait)
+
         history = get_chat_history(chat_id, limit=AI_HISTORY_LIMIT)
         messages = [Messages(role=MessagesRole.SYSTEM, content=AI_SYSTEM_PROMPT)]
         for is_from_owner, text in history:
@@ -337,11 +340,26 @@ async def get_ai_reply(chat_id: int, user_text: str) -> str | None:
             messages.append(Messages(role=MessagesRole.USER, content=user_text))
 
         logging.info(f"🧠 GigaChat: {len(messages)} сообщений в контексте")
-        loop = asyncio.get_event_loop()
-        response = await loop.run_in_executor(None, lambda: giga_client.chat(Chat(messages=messages)))
-        return response.choices[0].message.content.strip()
-    except Exception as e:
-        logging.error(f"GigaChat API error: {type(e).__name__}: {e}")
+
+        # Retry на 429
+        for attempt in range(4):
+            try:
+                response = await loop.run_in_executor(
+                    None, lambda: giga_client.chat(Chat(messages=messages))
+                )
+                giga_last_call = loop.time()
+                return response.choices[0].message.content.strip()
+            except Exception as e:
+                err_text = str(e)
+                if "429" in err_text or "Too Many Requests" in err_text or "RateLimit" in type(e).__name__:
+                    backoff = 2 ** attempt  # 1, 2, 4, 8
+                    logging.warning(f"⚠️ 429 от GigaChat, повтор через {backoff}с (попытка {attempt+1}/4)")
+                    await asyncio.sleep(backoff)
+                    continue
+                logging.error(f"GigaChat API error: {type(e).__name__}: {e}")
+                return None
+
+        logging.error("❌ GigaChat: исчерпаны попытки после 429")
         return None
 
 
@@ -385,7 +403,7 @@ async def handle_spam_command(message, bc_id, is_from_owner, owner_id):
 
 # ==================== КОМАНДА .forget ====================
 
-async def handle_forget_command(message, bc_id: str, owner_id: int):
+async def handle_forget_command(message, bc_id, owner_id):
     chat_id = message.chat.id
     set_history_reset(chat_id, datetime.now().isoformat())
     try:
@@ -394,15 +412,14 @@ async def handle_forget_command(message, bc_id: str, owner_id: int):
         logging.error(f"delete forget cmd error: {e}")
     logging.info(f"🧹 История сброшена для чата {chat_id}")
     try:
-        await bot.send_message(chat_id=chat_id, text="Хорошо, начнём с чистого листа.",
-                               business_connection_id=bc_id)
+        await bot.send_message(chat_id=chat_id, text="Хорошо, начнём с чистого листа.", business_connection_id=bc_id)
     except Exception as e:
         logging.error(f"forget reply error: {e}")
 
 
 # ==================== КОМАНДА .ai ====================
 
-async def handle_ai_command(message, bc_id: str, owner_id: int):
+async def handle_ai_command(message, bc_id, owner_id):
     text = (message.text or "").strip()
     chat_id = message.chat.id
 
@@ -415,8 +432,7 @@ async def handle_ai_command(message, bc_id: str, owner_id: int):
             logging.error(f"delete ai off error: {e}")
         logging.info(f"⏹ AI-режим выключен для чата {chat_id}")
         try:
-            await bot.send_message(chat_id=chat_id, text="Хорошо, дальше отвечаешь ты.",
-                                   business_connection_id=bc_id)
+            await bot.send_message(chat_id=chat_id, text="Хорошо, дальше отвечаешь ты.", business_connection_id=bc_id)
         except Exception as e:
             logging.error(f"ai off reply error: {e}")
         return
@@ -429,22 +445,15 @@ async def handle_ai_command(message, bc_id: str, owner_id: int):
         if not iso:
             await bot.send_message(chat_id=owner_id, text="❌ Не смог разобрать дату. Формат: `.ai on 14.10.2026 21:00`")
             return
-
         set_history_reset(chat_id, iso)
         set_ai_mode(chat_id, True)
-
         try:
             await bot(DeleteBusinessMessages(business_connection_id=bc_id, message_ids=[message.message_id]))
         except Exception as e:
             logging.error(f"delete ai on cmd error: {e}")
-
         logging.info(f"▶️ AI-режим ВКЛючён для чата {chat_id}, история с {iso}")
         try:
-            await bot.send_message(
-                chat_id=chat_id,
-                text="Ок, я на связи. Пиши.",
-                business_connection_id=bc_id
-            )
+            await bot.send_message(chat_id=chat_id, text="Ок, я на связи. Пиши.", business_connection_id=bc_id)
         except Exception as e:
             logging.error(f"ai on reply error: {e}")
         return
@@ -455,15 +464,13 @@ async def handle_ai_command(message, bc_id: str, owner_id: int):
         await bot.send_message(chat_id=owner_id,
                                text="❌ Использование:\n`.ai <вопрос>`\n`.ai on 14.10.2026 21:00`\n`.ai off`")
         return
-
     try:
         await bot(DeleteBusinessMessages(business_connection_id=bc_id, message_ids=[message.message_id]))
     except Exception as e:
         logging.error(f"delete .ai cmd error: {e}")
-
     reply = await get_ai_reply(chat_id, prompt)
     if not reply:
-        await bot.send_message(chat_id=owner_id, text="❌ ИИ недоступен.")
+        await bot.send_message(chat_id=owner_id, text="❌ ИИ недоступен (лимит или ошибка).")
         return
     try:
         result = await bot.send_message(chat_id=chat_id, text=reply, business_connection_id=bc_id)
@@ -485,7 +492,7 @@ async def cmd_start(message: types.Message):
         "Команды:\n"
         "`.spam <число> <текст>` — повторить N раз\n"
         "`.ai <вопрос>` — разовый ответ ИИ\n"
-        "`.ai on 14.10.2026 21:00` — включить ИИ-диалог с этой даты\n"
+        "`.ai on 14.10.2026 21:00` — включить ИИ-диалог\n"
         "`.ai off` — выключить ИИ-диалог\n"
         "`.forget` — сбросить историю"
     )
@@ -536,14 +543,11 @@ async def on_business_message(message: types.Message):
 
         # --- Обычное сообщение ---
         save_message(message, bc_id, is_from_owner,
-                     fallback_user_id=business_owner_id,
-                     fallback_user_name="Вы")
+                     fallback_user_id=business_owner_id, fallback_user_name="Вы")
         logging.info(f"💾 Сохранено msg {message.message_id}, автор: {'владелец' if is_from_owner else 'собеседник'}")
 
-        # --- AI-режим: отвечаем на сообщения СОБЕСЕДНИКА, пока не выключен ---
-        ai_on = is_ai_mode_on(chat_id)
-
-        if ai_on and not is_from_owner and AI_ENABLED and text:
+        # --- AI-режим: отвечаем собеседнику ---
+        if is_ai_mode_on(chat_id) and not is_from_owner and AI_ENABLED and text:
             logging.info(f"🤖 AI-режим: отвечаю собеседнику «{text[:60]}...»")
             reply = await get_ai_reply(chat_id, text)
             if reply:
@@ -573,8 +577,7 @@ async def on_edited_business_message(message: types.Message):
         author_id = message.from_user.id if message.from_user else 0
         is_from_owner = (author_id == business_owner_id) if business_owner_id else False
         save_message(message, bc_id, is_from_owner,
-                     fallback_user_id=business_owner_id or 0,
-                     fallback_user_name="Вы")
+                     fallback_user_id=business_owner_id or 0, fallback_user_name="Вы")
     except Exception as e:
         logging.error(f"Edit error: {e}")
 
@@ -626,8 +629,18 @@ async def on_deleted_business_messages(event: types.BusinessMessagesDeleted):
     for msg_id in event.message_ids:
         row = get_message(event.chat.id, msg_id)
         if not row:
-            logging.warning(f"Msg {msg_id} не в БД")
+            # Сообщения нет в БД — скорее всего, было отправлено до запуска бота
+            logging.warning(f"Msg {msg_id} не в БД — вероятно, отправлено до запуска бота")
+            try:
+                await bot.send_message(
+                    chat_id=business_owner_id,
+                    text=f"🗑 Удалено сообщение (ID: {msg_id}) в чате {event.chat.id}\n"
+                         f"⚠️ Текст недоступен — сообщение было отправлено до запуска бота."
+                )
+            except Exception as e:
+                logging.error(f"notify missing msg error: {e}")
             continue
+
         (chat_id, message_id, user_id, user_name, user_username,
          bc, is_from_owner, text, content_type, file_id, caption, date) = row
         header = build_header(user_name, user_username, user_id, chat_id,
