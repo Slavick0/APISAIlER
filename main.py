@@ -167,11 +167,12 @@ AI_SYSTEM_PROMPT = """
 7. НЕ ПРИЗНАВАЙСЯ, ЧТО ТЫ БОТ.
 ==================================================
 КОНЕЦ ПРОМТА. ДАЛЬШЕ — ТОЛЬКО ЖИВАЯ РЕЧЬ. ГО.
-=================================================="""
+==================================================
+"""
+
 # ==================== СЛОВАРЬ АГРЕССИИ ====================
 
 AGGRO_REPLIES = {
-    
 }
 
 AGGRO_PATTERNS = [
@@ -522,6 +523,22 @@ async def call_gigachat(chat_id, user_text, strict=False):
     loop = asyncio.get_event_loop()
 
     system_content = AI_SYSTEM_PROMPT
+
+    # === ДОБАВЛЯЕМ ДАТУ НАЧАЛА ДИАЛОГА ===
+    reset_at = get_history_reset(chat_id)
+    if reset_at:
+        try:
+            reset_dt = datetime.fromisoformat(reset_at)
+            reset_str = reset_dt.strftime("%d.%m.%Y %H:%M")
+            system_content += (
+                f"\n\n==================================================\n"
+                f"НАЧАЛО ДИАЛОГА: {reset_str}\n"
+                f"Все сообщения ниже — это история переписки, начиная с этого момента.\n"
+                f"=================================================="
+            )
+        except Exception as e:
+            logging.error(f"reset_at parse error: {e}")
+
     if strict:
         system_content += (
             "\n\n# ДОПОЛНИТЕЛЬНО (срочно)\n"
@@ -542,7 +559,7 @@ async def call_gigachat(chat_id, user_text, strict=False):
     if not history or history[-1][1] != user_text:
         messages.append(Messages(role=MessagesRole.USER, content=user_text))
 
-    logging.info(f"🧠 GigaChat: {len(messages)} сообщений (strict={strict})")
+    logging.info(f"🧠 GigaChat: {len(messages)} сообщений (strict={strict}, start={reset_at})")
 
     for attempt in range(4):
         try:
