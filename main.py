@@ -12,7 +12,7 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart
 from aiogram.methods import DeleteBusinessMessages
 
-# === ЗАМЕНА GIGACHAT НА GROQ ===
+# === ИМПОРТЫ ДЛЯ GROQ И АВТОИСПРАВЛЕНИЯ ===
 from openai import AsyncOpenAI
 from spellchecker import SpellChecker
 
@@ -32,16 +32,16 @@ except Exception as e:
     spell_ru = None
     logging.error(f"❌ Ошибка загрузки pyspellchecker: {e}")
 
-# ==================== НАСТРОЙКИ GROQ ====================
+# ==================== НАСТРОЙКИ ====================
 AI_ENABLED = True
 AI_HISTORY_LIMIT = 50
 AI_QUEUE_MAXSIZE = 10
-GIGA_MIN_INTERVAL = 1.0  # Groq быстрый, можно снизить паузу
+GIGA_MIN_INTERVAL = 1.0
+SPAM_MAX = 20
+SPAM_DELAY = 0.7
 
-# Доступные модели: llama-3.3-70b-versatile, llama-3.1-8b-instant, qwen/qwen3-32b, openai/gpt-oss-120b
 GROQ_MODEL = "llama-3.3-70b-versatile"
 
-# Инициализация клиента Groq (совместим с OpenAI)
 groq_client = AsyncOpenAI(
     base_url="https://api.groq.com/openai/v1",
     api_key=GROQ_API_KEY,
@@ -356,6 +356,27 @@ def fix_typos(text):
     except Exception as e:
         logging.error(f"spellchecker error: {e}")
         return text
+
+# ==================== ДЕДУПЛИКАЦИЯ И ОЧЕРЕДЬ ====================
+DEDUP_CACHE = {}
+DEDUP_TTL = 30
+ai_queue = None
+giga_last_call = 0.0
+
+def dedup_check_and_mark(sender_id, chat_id, text):
+    try:
+        loop = asyncio.get_event_loop()
+        now = loop.time()
+    except Exception:
+        now = 0
+    for k in list(DEDUP_CACHE.keys()):
+        if now - DEDUP_CACHE[k] > DEDUP_TTL:
+            del DEDUP_CACHE[k]
+    key = (sender_id, chat_id, (text or "").strip().lower())
+    if key in DEDUP_CACHE:
+        return True
+    DEDUP_CACHE[key] = now
+    return False
 
 # ==================== GROQ ЗАПРОС ====================
 async def call_groq(chat_id, user_text, strict=False):
