@@ -1,5 +1,5 @@
 aiogram==3.22.0
 openai
+pyspellchecker
 requests
 urllib3
-pyspellchecker
