@@ -35,7 +35,7 @@ SPAM_MAX = 20
 SPAM_DELAY = 0.7
 
 # Сменили на надежную и быструю модель
-GROQ_MODEL = "llama-3.1-8b-instant" 
+GROQ_MODEL = "openai/gpt-oss-120b"
 
 groq_client = AsyncOpenAI(
     base_url="https://api.groq.com/openai/v1",
