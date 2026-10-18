@@ -15,7 +15,8 @@ from aiogram.methods import DeleteBusinessMessages
 from gigachat import GigaChat
 from gigachat.models import Chat, Messages, MessagesRole
 
-from autocorrect import Speller
+# === ЗАМЕНА АВТОИСПРАВЛЕНИЯ ===
+from spellchecker import SpellChecker
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GIGACHAT_CREDENTIALS = os.getenv("GIGACHAT_CREDENTIALS")
@@ -25,12 +26,13 @@ if not BOT_TOKEN:
 if not GIGACHAT_CREDENTIALS:
     raise ValueError("GIGACHAT_CREDENTIALS не задан в Secrets!")
 
-spell_ru = None
+# Инициализация корректора для русского языка
 try:
-    spell_ru = Speller(lang='ru')
-    logging.info("🔧 Автокорректор загружен")
+    spell_ru = SpellChecker(language='ru')
+    logging.info("🔧 Автокорректор (pyspellchecker) загружен")
 except Exception as e:
-    logging.error(f"❌ Ошибка автокорректора: {e}")
+    spell_ru = None
+    logging.error(f"❌ Ошибка загрузки pyspellchecker: {e}")
 
 AI_ENABLED = True
 AI_MODEL = "GigaChat-2"
@@ -52,10 +54,7 @@ AI_SYSTEM_PROMPT = """
 - Ты агрессивный, дерзкий, саркастичный.
 - Ты любишь подкалывать, оскорблять, ставить в неловкое положение.
 - Ты часто притворяешься кем-то другим: «Я твоя совесть. Или твоя душа. Или твой ум. Кто же я?»
-- Ты ловишь на ошибках: «знак вопроса забыл(а)», «ты бы хоть запятую поставил(а)».
-- Ты спамишь: несколько коротких сообщений подряд.
-- Ты используешь «твоя мама» шутки: «твоя мама настолько жирная, что...»
-- Ты можешь внезапно сменить тон на «прости», «ой», «это не я», «не выдержала?», чтобы сбить с толку.
+- Ты ловишь на ошибках: «знак вопроса забыл(а)», «ты бы хоть запятую поставил(а)», например если понятно что это риторический вопрос например я ебу ты говоришь о знаке вопроса.
 - Ты не оправдываешься. Не читаешь морали. Не пишешь длинные лекции.
 - Ты пишешь чтоб смысел был нормальный, но не доконца
 - Общаешься исключительно на ту тему которая была до этого, даже если тебя пытаются от нее отвести не переключайся.
@@ -63,13 +62,13 @@ AI_SYSTEM_PROMPT = """
 - всегда поддерживай разговор.
 - Не провоцируй человека, чтоб тот закончил разговор
 - ты не используешь одно и то же по смыслу предложение в больше одного раза среди 5 подрят идущих сообщений
-===================================================
+
+==================================================
 СТИЛЬ РЕЧИ
 ==================================================
 - Короткие сообщения. Одно-два предложения.
 - Мат — умеренно: «иди нахуй», «соси», «чмо», «тупой», «дебил», «сын шлюхи» (как оскорбление, но без угроз).
 - Часто задаёшь встречный вопрос.
-- Повторяешься: «соси», «иди нахуй», «воздух = мой член, дыши глубже», «знак вопроса забыла», «не выдержала?».
 - Можешь написать несколько сообщений подряд без ответа собеседника.
 - Используешь абсурдные сравнения и гиперболы.
 
@@ -332,9 +331,19 @@ def fix_typos(text):
     if not spell_ru or not text:
         return text
     try:
-        return spell_ru(text)
+        words = re.findall(r'[а-яА-ЯёЁa-zA-Z]+', text)
+        misspelled = spell_ru.unknown(words)
+        if not misspelled:
+            return text
+        
+        corrected_text = text
+        for word in misspelled:
+            correction = spell_ru.correction(word)
+            if correction and correction != word:
+                corrected_text = re.sub(r'\b' + re.escape(word) + r'\b', correction, corrected_text, flags=re.IGNORECASE)
+        return corrected_text
     except Exception as e:
-        logging.error(f"autocorrect error: {e}")
+        logging.error(f"spellchecker error: {e}")
         return text
 
 # ==================== GIGACHAT ====================
