@@ -2,3 +2,4 @@ aiogram==3.22.0
 gigachat
 requests
 urllib3
+autocorrect
