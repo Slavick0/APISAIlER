@@ -597,6 +597,59 @@ async def handle_ai_command(message, bc_id, owner_id):
         except Exception:
             pass
 
+# ==================== GIT ====================
+async def git_sync_loop():
+    while True:
+        await asyncio.sleep(60)
+        try:
+            subprocess.run(["git", "config", "user.email", "bot@example.com"], check=True)
+            subprocess.run(["git", "config", "user.name", "Bot"], check=True)
+            subprocess.run(["git", "add", DB_PATH], check=True)
+            result = subprocess.run(["git", "commit", "-m", f"Update DB {datetime.now().isoformat()}"],
+                                    capture_output=True, text=True)
+            if result.returncode == 0:
+                subprocess.run(["git", "push"], check=True)
+                logging.info("📤 БД синхронизирована с GitHub")
+        except Exception as e:
+            logging.error(f"Git sync error: {e}")
+
+# ==================== УТИЛИТЫ ====================
+def format_time(iso_date):
+    try:
+        dt = datetime.fromisoformat(iso_date)
+        return dt.strftime("%d.%m.%Y | %H:%M:%S")
+    except Exception:
+        return iso_date
+
+def get_type_label(content_type):
+    labels = {"text": "текстовое сообщение", "photo": "фото", "video": "видео",
+              "document": "документ", "voice": "голосовое сообщение", "audio": "аудио",
+              "sticker": "стикер", "video_note": "видеосообщение", "animation": "GIF"}
+    return labels.get(content_type, content_type)
+
+def build_header(user_name, user_username, user_id, chat_id, date_iso, content_type, is_from_owner):
+    type_label = get_type_label(content_type)
+    if is_from_owner:
+        display_name = "Вы"
+    else:
+        display_name = user_name or "Неизвестный"
+        if user_username:
+            display_name += f" (@{user_username})"
+    return (
+        f"🗑 Удалено {type_label}\n"
+        f"👤 От:     {display_name}\n"
+        f"🆔 User ID: {user_id}\n"
+        f"💬 Chat ID: {chat_id}\n"
+        f"🕒 Время:  {format_time(date_iso)}"
+    )
+
+def parse_date_time(date_str, time_str):
+    try:
+        dt = datetime.strptime(f"{date_str} {time_str}", "%d.%m.%Y %H:%M")
+        return dt.isoformat()
+    except Exception:
+        return None
+
 # ==================== БОТ ====================
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
