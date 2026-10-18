@@ -40,7 +40,7 @@ GIGA_MIN_INTERVAL = 1.0
 SPAM_MAX = 20
 SPAM_DELAY = 0.7
 
-GROQ_MODEL = "llama-3.3-70b-versatile"
+GROQ_MODEL = "openai/gpt-oss-120b"
 
 groq_client = AsyncOpenAI(
     base_url="https://api.groq.com/openai/v1",
