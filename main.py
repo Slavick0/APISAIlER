@@ -12,17 +12,17 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart
 from aiogram.methods import DeleteBusinessMessages
 
-# === ЗАМЕНА GIGACHAT НА CEREBRAS ===
+# === ЗАМЕНА GIGACHAT НА GROQ ===
 from openai import AsyncOpenAI
 from spellchecker import SpellChecker
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-CEREBRAS_API_KEY = os.getenv("CEREBRAS_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN не задан в Secrets!")
-if not CEREBRAS_API_KEY:
-    raise ValueError("CEREBRAS_API_KEY не задан в Secrets!")
+if not GROQ_API_KEY:
+    raise ValueError("GROQ_API_KEY не задан в Secrets!")
 
 # Инициализация корректора
 try:
@@ -32,19 +32,19 @@ except Exception as e:
     spell_ru = None
     logging.error(f"❌ Ошибка загрузки pyspellchecker: {e}")
 
-# ==================== НАСТРОЙКИ CEREBRAS ====================
+# ==================== НАСТРОЙКИ GROQ ====================
 AI_ENABLED = True
 AI_HISTORY_LIMIT = 50
 AI_QUEUE_MAXSIZE = 10
-GIGA_MIN_INTERVAL = 1.0  # Cerebras быстрый, можно снизить паузу
+GIGA_MIN_INTERVAL = 1.0  # Groq быстрый, можно снизить паузу
 
-# Доступные модели: llama-3.3-70b, qwen-3-32b, qwen-3.8-27b, gpt-oss-120b[reference:8][reference:9]
-CEREBRAS_MODEL = "llama-3.3-70b"
+# Доступные модели: llama-3.3-70b-versatile, llama-3.1-8b-instant, qwen/qwen3-32b, openai/gpt-oss-120b
+GROQ_MODEL = "llama-3.3-70b-versatile"
 
-# Инициализация клиента Cerebras (совместим с OpenAI)
-cerebras_client = AsyncOpenAI(
-    base_url="https://api.cerebras.ai/v1",
-    api_key=CEREBRAS_API_KEY,
+# Инициализация клиента Groq (совместим с OpenAI)
+groq_client = AsyncOpenAI(
+    base_url="https://api.groq.com/openai/v1",
+    api_key=GROQ_API_KEY,
 )
 
 # ==================== ПРОМПТ ====================
@@ -357,9 +357,9 @@ def fix_typos(text):
         logging.error(f"spellchecker error: {e}")
         return text
 
-# ==================== CEREBRAS ЗАПРОС ====================
-async def call_cerebras(chat_id, user_text, strict=False):
-    if not AI_ENABLED or not cerebras_client:
+# ==================== GROQ ЗАПРОС ====================
+async def call_groq(chat_id, user_text, strict=False):
+    if not AI_ENABLED or not groq_client:
         return None
 
     loop = asyncio.get_event_loop()
@@ -402,12 +402,12 @@ async def call_cerebras(chat_id, user_text, strict=False):
     if not history or history[-1][1] != user_text:
         messages.append({"role": "user", "content": corrected_user_text})
 
-    logging.info(f"🧠 Cerebras ({CEREBRAS_MODEL}): {len(messages)} сообщений (strict={strict}, start={reset_at})")
+    logging.info(f"🧠 Groq ({GROQ_MODEL}): {len(messages)} сообщений (strict={strict}, start={reset_at})")
 
     for attempt in range(4):
         try:
-            response = await cerebras_client.chat.completions.create(
-                model=CEREBRAS_MODEL,
+            response = await groq_client.chat.completions.create(
+                model=GROQ_MODEL,
                 messages=messages,
                 temperature=0.8,
                 max_tokens=300,
@@ -427,7 +427,7 @@ async def call_cerebras(chat_id, user_text, strict=False):
                 logging.warning(f"⚠️ 429 (лимит), повтор через {backoff}с")
                 await asyncio.sleep(backoff)
                 continue
-            logging.error(f"Cerebras API error: {type(e).__name__}: {e}")
+            logging.error(f"Groq API error: {type(e).__name__}: {e}")
             return None
     return None
 
@@ -459,13 +459,13 @@ async def ai_worker():
             if wait > 0:
                 await asyncio.sleep(wait)
 
-            logging.info(f"📥 Cerebras: обрабатываю для {chat_id} (осталось {ai_queue.qsize()})")
-            reply = await call_cerebras(chat_id, user_text)
+            logging.info(f"📥 Groq: обрабатываю для {chat_id} (осталось {ai_queue.qsize()})")
+            reply = await call_groq(chat_id, user_text)
 
             if reply and is_bad_reply(reply):
                 logging.warning(f"⚠️ Сломал образ: «{reply[:80]}»")
                 await asyncio.sleep(1.2)
-                reply = await call_cerebras(chat_id, user_text, strict=True)
+                reply = await call_groq(chat_id, user_text, strict=True)
                 if reply and is_bad_reply(reply):
                     reply = random.choice(["хз", "не знаю", "ок", "понял", "норм"])
 
@@ -823,7 +823,7 @@ async def main():
                         format="%(asctime)s [%(levelname)s] %(message)s")
     init_db()
     ai_queue = asyncio.Queue(maxsize=AI_QUEUE_MAXSIZE)
-    logging.info(f"🚀 Бот запущен. Cerebras: {'включён' if AI_ENABLED else 'выключен'}")
+    logging.info(f"🚀 Бот запущен. Groq: {'включён' if AI_ENABLED else 'выключен'}")
 
     asyncio.create_task(ai_worker())
     asyncio.create_task(git_sync_loop())
