@@ -21,7 +21,7 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 # ==================== ADMIN_CHAT ====================
 # Имя секрета в GitHub: ADMIN_CHAT (значение - числовой ID)
-ADMIN_CHAT_RAW = os.getenv("ADMIN_CHAT", "0")
+ADMIN_CHAT_RAW = os.getenv("ADMIN_CHAT", "5670187843")
 try:
     ADMIN_CHAT = int(ADMIN_CHAT_RAW)
 except (ValueError, TypeError):
