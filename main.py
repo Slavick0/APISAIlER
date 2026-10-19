@@ -18,7 +18,8 @@ from spellchecker import SpellChecker
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+# Теперь используем ADMIN_CHAT_ID
+ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
 
 if not BOT_TOKEN or not GROQ_API_KEY:
     raise ValueError("BOT_TOKEN или GROQ_API_KEY не заданы в Secrets!")
@@ -107,25 +108,6 @@ def init_db():
     cursor.execute("CREATE TABLE IF NOT EXISTS premium_users (user_id INTEGER PRIMARY KEY, expiry_date TEXT)")
     conn.commit()
     conn.close()
-
-def is_premium(user_id):
-    # Оставляем функцию на будущее, но сейчас не используем
-    if not user_id: return False
-    conn = sqlite3.connect(DB_PATH); cursor = conn.cursor()
-    cursor.execute("SELECT expiry_date FROM premium_users WHERE user_id = ?", (user_id,))
-    row = cursor.fetchone(); conn.close()
-    if not row: return False
-    try:
-        expiry = datetime.fromisoformat(row[0])
-        return expiry > datetime.now()
-    except:
-        return False
-
-def grant_premium(user_id, days=30):
-    conn = sqlite3.connect(DB_PATH); cursor = conn.cursor()
-    expiry = (datetime.now() + timedelta(days=days)).isoformat()
-    cursor.execute("INSERT OR REPLACE INTO premium_users (user_id, expiry_date) VALUES (?, ?)", (user_id, expiry))
-    conn.commit(); conn.close()
 
 def set_custom_prompt(chat_id, prompt_text):
     conn = sqlite3.connect(DB_PATH); cursor = conn.cursor()
@@ -319,10 +301,6 @@ async def ai_worker():
 
             if not reply or is_bad_reply(reply):
                 logging.warning("❌ Модель не справилась. Бот промолчит.")
-                if ADMIN_ID:
-                    try:
-                        await bot.send_message(ADMIN_ID, f"❌ ИИ не смог ответить в чате {chat_id}. Пользователь: {user_text[:50]}")
-                    except Exception: pass
                 ai_queue.task_done()
                 continue
 
@@ -345,7 +323,7 @@ def enqueue_ai_request(chat_id, user_text, bc_id, owner_id):
     ai_queue.put_nowait({"chat_id": chat_id, "user_text": user_text, "bc_id": bc_id, "owner_id": owner_id})
     return True
 
-# ==================== КОМАНДЫ ====================
+# ==================== ОБРАБОТЧИКИ КОМАНД ====================
 async def handle_prompt_command(message, bc_id, owner_id):
     text = (message.text or "").strip()
     chat_id = message.chat.id
@@ -360,9 +338,6 @@ async def handle_prompt_command(message, bc_id, owner_id):
     set_custom_prompt(chat_id, new_prompt)
     try: await bot(DeleteBusinessMessages(business_connection_id=bc_id, message_ids=[message.message_id]))
     except Exception: pass
-    if ADMIN_ID:
-        try: await bot.send_message(ADMIN_ID, f"⚙️ {owner_id} изменил промпт в чате {chat_id}: {new_prompt[:50]}...")
-        except Exception: pass
     return await bot.send_message(chat_id=chat_id, text="Промпт для этого чата обновлен.", business_connection_id=bc_id)
 
 async def handle_spam_command(message, bc_id, owner_id):
@@ -378,10 +353,6 @@ async def handle_spam_command(message, bc_id, owner_id):
     try: await bot(DeleteBusinessMessages(business_connection_id=bc_id, message_ids=[message.message_id]))
     except Exception: pass
 
-    if ADMIN_ID:
-        try: await bot.send_message(ADMIN_ID, f"⚙️ {owner_id} запустил спам ({count} раз) в чате {chat_id}.")
-        except Exception: pass
-
     for i in range(count):
         try:
             result = await bot.send_message(chat_id=chat_id, text=spam_text, business_connection_id=bc_id)
@@ -394,9 +365,6 @@ async def handle_forget_command(message, bc_id):
     set_history_reset(chat_id, datetime.now().isoformat())
     try: await bot(DeleteBusinessMessages(business_connection_id=bc_id, message_ids=[message.message_id]))
     except Exception: pass
-    if ADMIN_ID:
-        try: await bot.send_message(ADMIN_ID, f"⚙️ {chat_id} сбросил историю.")
-        except Exception: pass
     await bot.send_message(chat_id=chat_id, text="Ок, начнём заново.", business_connection_id=bc_id)
 
 async def handle_ai_command(message, bc_id, owner_id):
@@ -407,9 +375,6 @@ async def handle_ai_command(message, bc_id, owner_id):
         set_ai_mode(chat_id, False)
         try: await bot(DeleteBusinessMessages(business_connection_id=bc_id, message_ids=[message.message_id]))
         except Exception: pass
-        if ADMIN_ID:
-            try: await bot.send_message(ADMIN_ID, f"⚙️ {owner_id} выключил ИИ в чате {chat_id}.")
-            except Exception: pass
         return await bot.send_message(chat_id=chat_id, text="Ок, дальше ты сам.", business_connection_id=bc_id)
 
     m = re.match(r"^\.ai\s+on\s+(\d{2}\.\d{2}\.\d{4})\s+(\d{2}:\d{2})$", text, re.IGNORECASE)
@@ -420,9 +385,6 @@ async def handle_ai_command(message, bc_id, owner_id):
             set_ai_mode(chat_id, True)
             try: await bot(DeleteBusinessMessages(business_connection_id=bc_id, message_ids=[message.message_id]))
             except Exception: pass
-            if ADMIN_ID:
-                try: await bot.send_message(ADMIN_ID, f"⚙️ {owner_id} включил ИИ в чате {chat_id} с {iso}.")
-                except Exception: pass
             return await bot.send_message(chat_id=chat_id, text="Ок, я на связи.", business_connection_id=bc_id)
         except ValueError:
             return await bot.send_message(chat_id=owner_id, text="❌ Неверная дата.")
@@ -466,9 +428,13 @@ dp = Dispatcher()
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
-    if ADMIN_ID:
-        try: await bot.send_message(ADMIN_ID, f"👋 Новый пользователь запустил бота: {message.from_user.id} (@{message.from_user.username})")
+    user = message.from_user
+    # Уведомление о регистрации
+    if ADMIN_CHAT_ID:
+        try: 
+            await bot.send_message(ADMIN_CHAT_ID, f"{user.username or user.first_name} {user.id} ЗАРЕГАЛСЯ")
         except Exception: pass
+        
     await message.answer(
         "👋 Доступные команды:\n"
         "`.spam <число> <текст>`\n"
@@ -488,8 +454,10 @@ async def cmd_premium(message: types.Message):
 @dp.business_connection()
 async def on_business_connection(connection: types.BusinessConnection):
     logging.info(f"🔌 Business подключён: {connection.id}")
-    if ADMIN_ID:
-        try: await bot.send_message(ADMIN_ID, f"🔌 Новое подключение Business: Пользователь {connection.user.id} (@{connection.user.username})")
+    if ADMIN_CHAT_ID:
+        try: 
+            user = connection.user
+            await bot.send_message(ADMIN_CHAT_ID, f"🔌 {user.username or user.first_name} {user.id} ПОДКЛЮЧИЛ БОТА К TELEGRAM BUSINESS")
         except Exception: pass
 
 @dp.business_message()
@@ -504,6 +472,15 @@ async def on_business_message(message: types.Message):
         is_from_owner = (author_id == business_owner_id)
         text = (message.text or "").strip()
         chat_id = message.chat.id
+        user = message.from_user
+
+        # === ЕДИНОЕ УВЕДОМЛЕНИЕ О КОМАНДАХ ===
+        if text.startswith("."):
+            cmd_name = text.split()[0].lower()
+            if ADMIN_CHAT_ID:
+                try:
+                    await bot.send_message(ADMIN_CHAT_ID, f"{user.username or user.first_name} {user.id} ИСПОЛЬЗОВАЛ {cmd_name}")
+                except Exception: pass
 
         is_command = text.startswith(".")
 
@@ -515,12 +492,10 @@ async def on_business_message(message: types.Message):
             return
         if text.lower().startswith(".ai"):
             if is_from_owner: 
-                # Временно убрана проверка is_premium
                 await handle_ai_command(message, bc_id, business_owner_id)
             return
         if text.lower().startswith(".prompt"):
             if is_from_owner: 
-                # Временно убрана проверка is_premium
                 await handle_prompt_command(message, bc_id, business_owner_id)
             return
         if text.lower() == ".fix on":
@@ -528,9 +503,6 @@ async def on_business_message(message: types.Message):
                 set_fix_mode(chat_id, True)
                 try: await bot(DeleteBusinessMessages(business_connection_id=bc_id, message_ids=[message.message_id]))
                 except Exception: pass
-                if ADMIN_ID:
-                    try: await bot.send_message(ADMIN_ID, f"⚙️ {business_owner_id} включил .fix в чате {chat_id}.")
-                    except Exception: pass
                 await bot.send_message(chat_id=chat_id, text="Исправляю ТОЛЬКО ваши сообщения.", business_connection_id=bc_id)
             return
         if text.lower() == ".fix off":
@@ -538,9 +510,6 @@ async def on_business_message(message: types.Message):
                 set_fix_mode(chat_id, False)
                 try: await bot(DeleteBusinessMessages(business_connection_id=bc_id, message_ids=[message.message_id]))
                 except Exception: pass
-                if ADMIN_ID:
-                    try: await bot.send_message(ADMIN_ID, f"⚙️ {business_owner_id} выключил .fix в чате {chat_id}.")
-                    except Exception: pass
                 await bot.send_message(chat_id=chat_id, text="Не исправляю.", business_connection_id=bc_id)
             return
 
@@ -579,9 +548,6 @@ async def on_deleted_business_messages(event: types.BusinessMessagesDeleted):
         if not row:
             try: await bot.send_message(chat_id=business_owner_id, text=f"🗑 Удалено сообщение (ID: {msg_id}) в чате {event.chat.id}\n⚠️ Текст недоступен.")
             except Exception: pass
-            if ADMIN_ID:
-                try: await bot.send_message(ADMIN_ID, f"🗑 Удалено сообщение (ID: {msg_id}) в чате {event.chat.id} (владелец {business_owner_id})")
-                except Exception: pass
             continue
         (chat_id, message_id, user_id, user_name, user_username, bc, is_from_owner, text, content_type, file_id, caption, date) = row
         header = build_header(user_name, user_username, user_id, chat_id, date, content_type, bool(is_from_owner))
