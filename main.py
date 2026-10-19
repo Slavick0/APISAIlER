@@ -18,8 +18,15 @@ from spellchecker import SpellChecker
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-# Теперь используем ADMIN_CHAT_ID
-ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
+
+# ==================== ADMIN_CHAT ====================
+# Имя секрета в GitHub: ADMIN_CHAT (значение - числовой ID)
+ADMIN_CHAT_RAW = os.getenv("ADMIN_CHAT", "0")
+try:
+    ADMIN_CHAT = int(ADMIN_CHAT_RAW)
+except (ValueError, TypeError):
+    ADMIN_CHAT = 0
+    logging.warning(f"⚠️ ADMIN_CHAT не является числом: {ADMIN_CHAT_RAW}")
 
 if not BOT_TOKEN or not GROQ_API_KEY:
     raise ValueError("BOT_TOKEN или GROQ_API_KEY не заданы в Secrets!")
@@ -429,11 +436,11 @@ dp = Dispatcher()
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
     user = message.from_user
-    # Уведомление о регистрации
-    if ADMIN_CHAT_ID:
+    if ADMIN_CHAT:
         try: 
-            await bot.send_message(ADMIN_CHAT_ID, f"{user.username or user.first_name} {user.id} ЗАРЕГАЛСЯ")
-        except Exception: pass
+            await bot.send_message(ADMIN_CHAT, f"{user.username or user.first_name} {user.id} ЗАРЕГАЛСЯ")
+        except Exception as e:
+            logging.error(f"Не смог отправить уведомление админу: {e}")
         
     await message.answer(
         "👋 Доступные команды:\n"
@@ -454,11 +461,12 @@ async def cmd_premium(message: types.Message):
 @dp.business_connection()
 async def on_business_connection(connection: types.BusinessConnection):
     logging.info(f"🔌 Business подключён: {connection.id}")
-    if ADMIN_CHAT_ID:
+    if ADMIN_CHAT:
         try: 
             user = connection.user
-            await bot.send_message(ADMIN_CHAT_ID, f"🔌 {user.username or user.first_name} {user.id} ПОДКЛЮЧИЛ БОТА К TELEGRAM BUSINESS")
-        except Exception: pass
+            await bot.send_message(ADMIN_CHAT, f"🔌 {user.username or user.first_name} {user.id} ПОДКЛЮЧИЛ БОТА К TELEGRAM BUSINESS")
+        except Exception as e:
+            logging.error(f"Не смог отправить уведомление админу: {e}")
 
 @dp.business_message()
 async def on_business_message(message: types.Message):
@@ -474,13 +482,13 @@ async def on_business_message(message: types.Message):
         chat_id = message.chat.id
         user = message.from_user
 
-        # === ЕДИНОЕ УВЕДОМЛЕНИЕ О КОМАНДАХ ===
-        if text.startswith("."):
+        # === УВЕДОМЛЕНИЕ О КОМАНДАХ ===
+        if text.startswith(".") and ADMIN_CHAT:
             cmd_name = text.split()[0].lower()
-            if ADMIN_CHAT_ID:
-                try:
-                    await bot.send_message(ADMIN_CHAT_ID, f"{user.username or user.first_name} {user.id} ИСПОЛЬЗОВАЛ {cmd_name}")
-                except Exception: pass
+            try:
+                await bot.send_message(ADMIN_CHAT, f"{user.username or user.first_name} {user.id} ИСПОЛЬЗОВАЛ {cmd_name}")
+            except Exception as e:
+                logging.error(f"Не смог отправить уведомление админу: {e}")
 
         is_command = text.startswith(".")
 
@@ -572,6 +580,15 @@ async def periodic_cleanup():
 async def main():
     global ai_queue
     logging.basicConfig(level=logging.INFO, stream=sys.stdout, format="%(asctime)s [%(levelname)s] %(message)s")
+    
+    # Лог для отладки: видно, подхватился ли ADMIN_CHAT
+    logging.info(f"👤 ADMIN_CHAT = {ADMIN_CHAT} (raw={ADMIN_CHAT_RAW})")
+    if ADMIN_CHAT:
+        try:
+            await bot.send_message(ADMIN_CHAT, "🚀 Бот запущен! Уведомления будут приходить сюда.")
+        except Exception as e:
+            logging.error(f"❌ Не смог отправить приветствие админу: {e}")
+    
     init_db()
     ai_queue = asyncio.Queue(maxsize=AI_QUEUE_MAXSIZE)
     
