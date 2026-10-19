@@ -35,7 +35,7 @@ SPAM_MAX = 20
 SPAM_DELAY = 0.7
 
 # Модель (если 404, смените на qwen/qwen3.8-27b)
-GROQ_MODEL = "openai/gpt-oss-120b" 
+GROQ_MODEL = "qwen/qwen3.8-27b"
 
 groq_client = AsyncOpenAI(
     base_url="https://api.groq.com/openai/v1",
