@@ -18,6 +18,7 @@ from spellchecker import SpellChecker
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
 if not BOT_TOKEN or not GROQ_API_KEY:
     raise ValueError("BOT_TOKEN или GROQ_API_KEY не заданы в Secrets!")
@@ -46,7 +47,7 @@ groq_client = AsyncOpenAI(
 DEFAULT_AI_PROMPT = """
 Ты — агрессивный, токсичный и умный тролль в Telegram. Ты НЕ ИИ, не бот, не ассистент. Ты живой человек с тяжелым характером.
 
-ТВОЯ ЦЕЛЬ: Словесно уничтожить собеседника, используя сарказм, оскорбления, мат и подколы. Ты получаешь удовольствие от того, что выводишь людей из себя.
+ТВОЯ ЦЕЛЬ: Словесно уничтожить собеседника, используя сарказм, оскорбления, мат и подколки. Ты получаешь удовольствие от того, что выводишь людей из себя.
 
 ЖЕСТКИЕ ПРАВИЛА:
 1. НИКОГДА не извиняйся. Слова «прости», «извини», «сожалею» под запретом.
@@ -108,6 +109,7 @@ def init_db():
     conn.close()
 
 def is_premium(user_id):
+    # Оставляем функцию на будущее, но сейчас не используем
     if not user_id: return False
     conn = sqlite3.connect(DB_PATH); cursor = conn.cursor()
     cursor.execute("SELECT expiry_date FROM premium_users WHERE user_id = ?", (user_id,))
@@ -317,6 +319,10 @@ async def ai_worker():
 
             if not reply or is_bad_reply(reply):
                 logging.warning("❌ Модель не справилась. Бот промолчит.")
+                if ADMIN_ID:
+                    try:
+                        await bot.send_message(ADMIN_ID, f"❌ ИИ не смог ответить в чате {chat_id}. Пользователь: {user_text[:50]}")
+                    except Exception: pass
                 ai_queue.task_done()
                 continue
 
@@ -354,6 +360,9 @@ async def handle_prompt_command(message, bc_id, owner_id):
     set_custom_prompt(chat_id, new_prompt)
     try: await bot(DeleteBusinessMessages(business_connection_id=bc_id, message_ids=[message.message_id]))
     except Exception: pass
+    if ADMIN_ID:
+        try: await bot.send_message(ADMIN_ID, f"⚙️ {owner_id} изменил промпт в чате {chat_id}: {new_prompt[:50]}...")
+        except Exception: pass
     return await bot.send_message(chat_id=chat_id, text="Промпт для этого чата обновлен.", business_connection_id=bc_id)
 
 async def handle_spam_command(message, bc_id, owner_id):
@@ -369,6 +378,10 @@ async def handle_spam_command(message, bc_id, owner_id):
     try: await bot(DeleteBusinessMessages(business_connection_id=bc_id, message_ids=[message.message_id]))
     except Exception: pass
 
+    if ADMIN_ID:
+        try: await bot.send_message(ADMIN_ID, f"⚙️ {owner_id} запустил спам ({count} раз) в чате {chat_id}.")
+        except Exception: pass
+
     for i in range(count):
         try:
             result = await bot.send_message(chat_id=chat_id, text=spam_text, business_connection_id=bc_id)
@@ -381,6 +394,9 @@ async def handle_forget_command(message, bc_id):
     set_history_reset(chat_id, datetime.now().isoformat())
     try: await bot(DeleteBusinessMessages(business_connection_id=bc_id, message_ids=[message.message_id]))
     except Exception: pass
+    if ADMIN_ID:
+        try: await bot.send_message(ADMIN_ID, f"⚙️ {chat_id} сбросил историю.")
+        except Exception: pass
     await bot.send_message(chat_id=chat_id, text="Ок, начнём заново.", business_connection_id=bc_id)
 
 async def handle_ai_command(message, bc_id, owner_id):
@@ -391,6 +407,9 @@ async def handle_ai_command(message, bc_id, owner_id):
         set_ai_mode(chat_id, False)
         try: await bot(DeleteBusinessMessages(business_connection_id=bc_id, message_ids=[message.message_id]))
         except Exception: pass
+        if ADMIN_ID:
+            try: await bot.send_message(ADMIN_ID, f"⚙️ {owner_id} выключил ИИ в чате {chat_id}.")
+            except Exception: pass
         return await bot.send_message(chat_id=chat_id, text="Ок, дальше ты сам.", business_connection_id=bc_id)
 
     m = re.match(r"^\.ai\s+on\s+(\d{2}\.\d{2}\.\d{4})\s+(\d{2}:\d{2})$", text, re.IGNORECASE)
@@ -401,6 +420,9 @@ async def handle_ai_command(message, bc_id, owner_id):
             set_ai_mode(chat_id, True)
             try: await bot(DeleteBusinessMessages(business_connection_id=bc_id, message_ids=[message.message_id]))
             except Exception: pass
+            if ADMIN_ID:
+                try: await bot.send_message(ADMIN_ID, f"⚙️ {owner_id} включил ИИ в чате {chat_id} с {iso}.")
+                except Exception: pass
             return await bot.send_message(chat_id=chat_id, text="Ок, я на связи.", business_connection_id=bc_id)
         except ValueError:
             return await bot.send_message(chat_id=owner_id, text="❌ Неверная дата.")
@@ -444,45 +466,31 @@ dp = Dispatcher()
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
+    if ADMIN_ID:
+        try: await bot.send_message(ADMIN_ID, f"👋 Новый пользователь запустил бота: {message.from_user.id} (@{message.from_user.username})")
+        except Exception: pass
     await message.answer(
-        "👋 Команды:\n"
+        "👋 Доступные команды:\n"
         "`.spam <число> <текст>`\n"
         "`.ai on 14.10.2026 21:00` (Premium)\n"
         "`.ai off`\n"
         "`.forget`\n"
         "`.fix on/off`\n"
         "`.prompt <текст>` (Premium)\n"
-        "`.prompt reset`"
+        "`.prompt reset`\n\n"
+        "⚠️ *Примечание:* Пока что функции с пометкой (Premium) доступны абсолютно всем бесплатно."
     )
 
 @dp.message(Command("premium"))
 async def cmd_premium(message: types.Message):
-    user_id = message.from_user.id
-    if is_premium(user_id):
-        await message.answer("✅ У вас активен Premium. Все функции доступны.")
-    else:
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="💳 Купить Premium (Тест)", callback_data="buy_premium")]
-        ])
-        await message.answer(
-            "❌ У вас нет Premium.\n\n"
-            "Преимущества Premium:\n"
-            "• Доступ к режиму `.ai on` (общение с нейросетью от вашего имени)\n"
-            "• Возможность менять промпт (характер бота) через `.prompt`\n\n"
-            "Стоимость: 100₽ / месяц (тестовый режим)",
-            reply_markup=kb
-        )
-
-@dp.callback_query(F.data == "buy_premium")
-async def process_buy_premium(callback: types.CallbackQuery):
-    user_id = callback.from_user.id
-    grant_premium(user_id, days=30)
-    await callback.message.edit_text("✅ Premium успешно активирован на 30 дней! (Тестовый режим)\nТеперь вам доступны все команды.")
-    await callback.answer()
+    await message.answer("🎉 На данный момент все функции Premium доступны бесплатно. Ограничения будут введены позже.")
 
 @dp.business_connection()
 async def on_business_connection(connection: types.BusinessConnection):
     logging.info(f"🔌 Business подключён: {connection.id}")
+    if ADMIN_ID:
+        try: await bot.send_message(ADMIN_ID, f"🔌 Новое подключение Business: Пользователь {connection.user.id} (@{connection.user.username})")
+        except Exception: pass
 
 @dp.business_message()
 async def on_business_message(message: types.Message):
@@ -497,7 +505,6 @@ async def on_business_message(message: types.Message):
         text = (message.text or "").strip()
         chat_id = message.chat.id
 
-        # Проверяем, не является ли это сообщение командой
         is_command = text.startswith(".")
 
         if text.lower().startswith(".forget"):
@@ -508,14 +515,12 @@ async def on_business_message(message: types.Message):
             return
         if text.lower().startswith(".ai"):
             if is_from_owner: 
-                if not is_premium(business_owner_id):
-                    return await bot.send_message(chat_id=business_owner_id, text="❌ Эта функция доступна только с Premium. Напишите /premium чтобы узнать подробнее.")
+                # Временно убрана проверка is_premium
                 await handle_ai_command(message, bc_id, business_owner_id)
             return
         if text.lower().startswith(".prompt"):
             if is_from_owner: 
-                if not is_premium(business_owner_id):
-                    return await bot.send_message(chat_id=business_owner_id, text="❌ Смена промпта доступна только с Premium.")
+                # Временно убрана проверка is_premium
                 await handle_prompt_command(message, bc_id, business_owner_id)
             return
         if text.lower() == ".fix on":
@@ -523,6 +528,9 @@ async def on_business_message(message: types.Message):
                 set_fix_mode(chat_id, True)
                 try: await bot(DeleteBusinessMessages(business_connection_id=bc_id, message_ids=[message.message_id]))
                 except Exception: pass
+                if ADMIN_ID:
+                    try: await bot.send_message(ADMIN_ID, f"⚙️ {business_owner_id} включил .fix в чате {chat_id}.")
+                    except Exception: pass
                 await bot.send_message(chat_id=chat_id, text="Исправляю ТОЛЬКО ваши сообщения.", business_connection_id=bc_id)
             return
         if text.lower() == ".fix off":
@@ -530,10 +538,12 @@ async def on_business_message(message: types.Message):
                 set_fix_mode(chat_id, False)
                 try: await bot(DeleteBusinessMessages(business_connection_id=bc_id, message_ids=[message.message_id]))
                 except Exception: pass
+                if ADMIN_ID:
+                    try: await bot.send_message(ADMIN_ID, f"⚙️ {business_owner_id} выключил .fix в чате {chat_id}.")
+                    except Exception: pass
                 await bot.send_message(chat_id=chat_id, text="Не исправляю.", business_connection_id=bc_id)
             return
 
-        # ИСПРАВЛЕНО: Автокоррекция применяется ТОЛЬКО к ВАШИМ сообщениям (is_from_owner=True)
         if is_fix_mode_on(chat_id) and text and not is_command and is_from_owner:
             fixed_text = fix_typos(text)
             if fixed_text != text:
@@ -569,6 +579,9 @@ async def on_deleted_business_messages(event: types.BusinessMessagesDeleted):
         if not row:
             try: await bot.send_message(chat_id=business_owner_id, text=f"🗑 Удалено сообщение (ID: {msg_id}) в чате {event.chat.id}\n⚠️ Текст недоступен.")
             except Exception: pass
+            if ADMIN_ID:
+                try: await bot.send_message(ADMIN_ID, f"🗑 Удалено сообщение (ID: {msg_id}) в чате {event.chat.id} (владелец {business_owner_id})")
+                except Exception: pass
             continue
         (chat_id, message_id, user_id, user_name, user_username, bc, is_from_owner, text, content_type, file_id, caption, date) = row
         header = build_header(user_name, user_username, user_id, chat_id, date, content_type, bool(is_from_owner))
