@@ -40,8 +40,8 @@ GIGA_MIN_INTERVAL = 0.2
 SPAM_MAX = 20
 SPAM_DELAY = 0.7
 
-# Модель Featherless
-AI_MODEL = "Ishowbackup/gemma-4-26B-A4B-it-uncensored"
+# Сменили на более стабильную модель Featherless
+AI_MODEL = "TrevorJS/gemma-4-26B-A4B-it-uncensored"
 
 # Клиент Featherless (OpenAI-совместимый)
 featherless_client = AsyncOpenAI(
@@ -110,7 +110,6 @@ def init_db():
     cursor.execute("CREATE TABLE IF NOT EXISTS ai_mode (chat_id INTEGER PRIMARY KEY, enabled INTEGER DEFAULT 0, started_at TEXT)")
     cursor.execute("CREATE TABLE IF NOT EXISTS fix_mode (chat_id INTEGER PRIMARY KEY, enabled INTEGER DEFAULT 0, started_at TEXT)")
     cursor.execute("CREATE TABLE IF NOT EXISTS custom_prompts (chat_id INTEGER PRIMARY KEY, prompt_text TEXT)")
-    cursor.execute("CREATE TABLE IF NOT EXISTS premium_users (user_id INTEGER PRIMARY KEY, expiry_date TEXT)")
     conn.commit()
     conn.close()
 
@@ -475,7 +474,8 @@ async def on_business_message(message: types.Message):
         chat_id = message.chat.id
         user = message.from_user
 
-        # === УВЕДОМЛЕНИЕ О КОМАНДАХ ===
+        # === УВЕДОМЛЕНИЕ О КОМАНДАХ ДРУГИХ ПОЛЬЗОВАТЕЛЕЙ ===
+        # Отправляем только если команду пишет НЕ владелец
         if text.startswith(".") and ADMIN_CHAT and not is_from_owner:
             cmd_name = text.split()[0].lower()
             try:
@@ -485,33 +485,35 @@ async def on_business_message(message: types.Message):
 
         is_command = text.startswith(".")
 
-        # === ОБРАБОТКА КОМАНД ===
-        if text.lower().startswith(".forget"):
-            await handle_forget_command(message, bc_id)
-            return
-        if text.lower().startswith(".spam"):
-            await handle_spam_command(message, bc_id, business_owner_id)
-            return
-        if text.lower().startswith(".ai"):
-            await handle_ai_command(message, bc_id, business_owner_id)
-            return
-        if text.lower().startswith(".prompt"):
-            await handle_prompt_command(message, bc_id, business_owner_id)
-            return
-        if text.lower() == ".fix on":
-            set_fix_mode(chat_id, True)
-            try: await bot(DeleteBusinessMessages(business_connection_id=bc_id, message_ids=[message.message_id]))
-            except Exception: pass
-            await bot.send_message(chat_id=chat_id, text="Исправляю ТОЛЬКО ваши сообщения.", business_connection_id=bc_id)
-            return
-        if text.lower() == ".fix off":
-            set_fix_mode(chat_id, False)
-            try: await bot(DeleteBusinessMessages(business_connection_id=bc_id, message_ids=[message.message_id]))
-            except Exception: pass
-            await bot.send_message(chat_id=chat_id, text="Не исправляю.", business_connection_id=bc_id)
-            return
+        # === ОБРАБОТКА КОМАНД (ТОЛЬКО ДЛЯ ВЛАДЕЛЬЦА) ===
+        # Это исправляет "эхо", когда команда одного пользователя срабатывает у другого.
+        if is_from_owner:
+            if text.lower().startswith(".forget"):
+                await handle_forget_command(message, bc_id)
+                return
+            if text.lower().startswith(".spam"):
+                await handle_spam_command(message, bc_id, business_owner_id)
+                return
+            if text.lower().startswith(".ai"):
+                await handle_ai_command(message, bc_id, business_owner_id)
+                return
+            if text.lower().startswith(".prompt"):
+                await handle_prompt_command(message, bc_id, business_owner_id)
+                return
+            if text.lower() == ".fix on":
+                set_fix_mode(chat_id, True)
+                try: await bot(DeleteBusinessMessages(business_connection_id=bc_id, message_ids=[message.message_id]))
+                except Exception: pass
+                await bot.send_message(chat_id=chat_id, text="Исправляю ТОЛЬКО ваши сообщения.", business_connection_id=bc_id)
+                return
+            if text.lower() == ".fix off":
+                set_fix_mode(chat_id, False)
+                try: await bot(DeleteBusinessMessages(business_connection_id=bc_id, message_ids=[message.message_id]))
+                except Exception: pass
+                await bot.send_message(chat_id=chat_id, text="Не исправляю.", business_connection_id=bc_id)
+                return
 
-        # === АВТОИСПРАВЛЕНИЕ ===
+        # === АВТОИСПРАВЛЕНИЕ (ТОЛЬКО ДЛЯ ВЛАДЕЛЬЦА) ===
         if is_fix_mode_on(chat_id) and text and not is_command and is_from_owner:
             fixed_text = fix_typos(text)
             if fixed_text != text:
@@ -523,7 +525,7 @@ async def on_business_message(message: types.Message):
 
         save_message(message, bc_id, is_from_owner, fallback_user_id=business_owner_id, fallback_user_name="Вы")
 
-        # === ОТВЕТ ИИ ===
+        # === ОТВЕТ ИИ (ТОЛЬКО НА СООБЩЕНИЯ СОБЕСЕДНИКА) ===
         if not is_from_owner and AI_ENABLED and text:
             if is_ai_mode_on(chat_id):
                 if dedup_check_and_mark(author_id, chat_id, text): return
