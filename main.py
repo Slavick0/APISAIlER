@@ -17,22 +17,21 @@ from openai import AsyncOpenAI
 from spellchecker import SpellChecker
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-FEATHERLESS_API_KEY = os.getenv("FEATHERLESS_API_KEY")
 ADMIN_CHAT_RAW = os.getenv("ADMIN_CHAT", "0")
 try:
     ADMIN_CHAT = int(ADMIN_CHAT_RAW)
 except (ValueError, TypeError):
     ADMIN_CHAT = 0
 
-if not BOT_TOKEN or not FEATHERLESS_API_KEY:
-    raise ValueError("BOT_TOKEN или FEATHERLESS_API_KEY не заданы в Secrets!")
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN не задан в Secrets!")
 
 try:
     spell_ru = SpellChecker(language='ru')
 except Exception:
     spell_ru = None
 
-# ==================== НАСТРОЙКИ FEATHERLESS ====================
+# ==================== НАСТРОЙКИ POLLINATIONS ====================
 AI_ENABLED = True
 AI_HISTORY_LIMIT = 30
 AI_QUEUE_MAXSIZE = 10
@@ -40,13 +39,14 @@ GIGA_MIN_INTERVAL = 0.2
 SPAM_MAX = 20
 SPAM_DELAY = 0.7
 
-# Сменили на более стабильную модель Featherless
-AI_MODEL = "TrevorJS/gemma-4-26B-A4B-it-uncensored"
+# Pollinations.ai совместим с OpenAI. Используем модель "openai".
+# Вы можете попробовать другие модели, например "openai-large" или "claude-hybridspace".
+AI_MODEL = "openai" 
 
-# Клиент Featherless (OpenAI-совместимый)
-featherless_client = AsyncOpenAI(
-    base_url="https://api.featherless.ai/v1",
-    api_key=FEATHERLESS_API_KEY,
+# Клиент Pollinations (OpenAI-совместимый). API-ключ не требуется, передаем заглушку.
+pollinations_client = AsyncOpenAI(
+    base_url="https://gen.pollinations.ai/v1",
+    api_key="not-needed",
 )
 
 # ==================== АГРЕССИВНЫЙ ПРОМПТ ====================
@@ -245,9 +245,9 @@ def dedup_check_and_mark(sender_id, chat_id, text):
     DEDUP_CACHE[key] = now
     return False
 
-# ==================== FEATHERLESS ЗАПРОС ====================
-async def call_featherless(chat_id, user_text, strict=False):
-    if not AI_ENABLED or not featherless_client: return None
+# ==================== POLLINATIONS ЗАПРОС ====================
+async def call_pollinations(chat_id, user_text, strict=False):
+    if not AI_ENABLED or not pollinations_client: return None
 
     custom_prompt = get_custom_prompt(chat_id)
     system_content = custom_prompt if custom_prompt else DEFAULT_AI_PROMPT
@@ -274,23 +274,23 @@ async def call_featherless(chat_id, user_text, strict=False):
     if not history or history[-1][1] != user_text:
         messages.append({"role": "user", "content": corrected_user_text})
 
-    logging.info(f"🧠 Featherless ({AI_MODEL}): {len(messages)} сообщений (strict={strict})")
+    logging.info(f"🧠 Pollinations ({AI_MODEL}): {len(messages)} сообщений (strict={strict})")
 
     for attempt in range(2): 
         try:
-            response = await featherless_client.chat.completions.create(
-                model=AI_MODEL, messages=messages, temperature=0.9, max_tokens=150, timeout=30
+            response = await pollinations_client.chat.completions.create(
+                model=AI_MODEL, messages=messages, temperature=0.9, max_tokens=150, timeout=60
             )
             raw = response.choices[0].message.content.strip()
             
             if is_bad_reply(raw) and not strict:
                 logging.warning(f"⚠️ Отказ модели: «{raw[:60]}». Пробую еще раз...")
-                return await call_featherless(chat_id, user_text, strict=True)
+                return await call_pollinations(chat_id, user_text, strict=True)
 
             return clean_ai_reply(fix_typos(raw))
         except Exception as e:
-            logging.error(f"Featherless API error: {type(e).__name__}: {e}")
-            if attempt == 0: await asyncio.sleep(0.5)
+            logging.error(f"Pollinations API error: {type(e).__name__}: {e}")
+            if attempt == 0: await asyncio.sleep(1.0) # Даем больше времени на повтор
     return None
 
 # ==================== ОЧЕРЕДЬ ====================
@@ -301,7 +301,7 @@ async def ai_worker():
             chat_id, user_text, bc_id, owner_id = item["chat_id"], item["user_text"], item["bc_id"], item["owner_id"]
 
             logging.info(f"📥 Обрабатываю для {chat_id}")
-            reply = await call_featherless(chat_id, user_text)
+            reply = await call_pollinations(chat_id, user_text)
 
             if not reply or is_bad_reply(reply):
                 logging.warning("❌ Модель не справилась. Бот промолчит.")
@@ -475,7 +475,6 @@ async def on_business_message(message: types.Message):
         user = message.from_user
 
         # === УВЕДОМЛЕНИЕ О КОМАНДАХ ДРУГИХ ПОЛЬЗОВАТЕЛЕЙ ===
-        # Отправляем только если команду пишет НЕ владелец
         if text.startswith(".") and ADMIN_CHAT and not is_from_owner:
             cmd_name = text.split()[0].lower()
             try:
@@ -486,7 +485,6 @@ async def on_business_message(message: types.Message):
         is_command = text.startswith(".")
 
         # === ОБРАБОТКА КОМАНД (ТОЛЬКО ДЛЯ ВЛАДЕЛЬЦА) ===
-        # Это исправляет "эхо", когда команда одного пользователя срабатывает у другого.
         if is_from_owner:
             if text.lower().startswith(".forget"):
                 await handle_forget_command(message, bc_id)
@@ -578,7 +576,7 @@ async def main():
     logging.info(f"👤 ADMIN_CHAT = {ADMIN_CHAT} (raw={ADMIN_CHAT_RAW})")
     if ADMIN_CHAT:
         try:
-            await bot.send_message(ADMIN_CHAT, "🚀 Бот запущен на Featherless AI! Уведомления будут приходить сюда.")
+            await bot.send_message(ADMIN_CHAT, "🚀 Бот запущен на Pollinations.ai! Уведомления будут приходить сюда.")
         except Exception as e:
             logging.error(f"❌ Не смог отправить приветствие админу: {e}")
     
