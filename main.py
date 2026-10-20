@@ -17,23 +17,22 @@ from openai import AsyncOpenAI
 from spellchecker import SpellChecker
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+FEATHERLESS_API_KEY = os.getenv("FEATHERLESS_API_KEY")
 ADMIN_CHAT_RAW = os.getenv("ADMIN_CHAT", "0")
 try:
     ADMIN_CHAT = int(ADMIN_CHAT_RAW)
 except (ValueError, TypeError):
     ADMIN_CHAT = 0
-    logging.warning(f"⚠️ ADMIN_CHAT не является числом: {ADMIN_CHAT_RAW}")
 
-if not BOT_TOKEN or not GROQ_API_KEY:
-    raise ValueError("BOT_TOKEN или GROQ_API_KEY не заданы в Secrets!")
+if not BOT_TOKEN or not FEATHERLESS_API_KEY:
+    raise ValueError("BOT_TOKEN или FEATHERLESS_API_KEY не заданы в Secrets!")
 
 try:
     spell_ru = SpellChecker(language='ru')
 except Exception:
     spell_ru = None
 
-# ==================== НАСТРОЙКИ ====================
+# ==================== НАСТРОЙКИ FEATHERLESS ====================
 AI_ENABLED = True
 AI_HISTORY_LIMIT = 30
 AI_QUEUE_MAXSIZE = 10
@@ -41,11 +40,13 @@ GIGA_MIN_INTERVAL = 0.2
 SPAM_MAX = 20
 SPAM_DELAY = 0.7
 
-GROQ_MODEL = "openai/gpt-oss-120b" 
+# Модель Featherless
+AI_MODEL = "Ishowbackup/gemma-4-26B-A4B-it-uncensored"
 
-groq_client = AsyncOpenAI(
-    base_url="https://api.groq.com/openai/v1",
-    api_key=GROQ_API_KEY,
+# Клиент Featherless (OpenAI-совместимый)
+featherless_client = AsyncOpenAI(
+    base_url="https://api.featherless.ai/v1",
+    api_key=FEATHERLESS_API_KEY,
 )
 
 # ==================== АГРЕССИВНЫЙ ПРОМПТ ====================
@@ -245,9 +246,9 @@ def dedup_check_and_mark(sender_id, chat_id, text):
     DEDUP_CACHE[key] = now
     return False
 
-# ==================== GROQ ====================
-async def call_groq(chat_id, user_text, strict=False):
-    if not AI_ENABLED or not groq_client: return None
+# ==================== FEATHERLESS ЗАПРОС ====================
+async def call_featherless(chat_id, user_text, strict=False):
+    if not AI_ENABLED or not featherless_client: return None
 
     custom_prompt = get_custom_prompt(chat_id)
     system_content = custom_prompt if custom_prompt else DEFAULT_AI_PROMPT
@@ -274,22 +275,22 @@ async def call_groq(chat_id, user_text, strict=False):
     if not history or history[-1][1] != user_text:
         messages.append({"role": "user", "content": corrected_user_text})
 
-    logging.info(f"🧠 Groq ({GROQ_MODEL}): {len(messages)} сообщений (strict={strict})")
+    logging.info(f"🧠 Featherless ({AI_MODEL}): {len(messages)} сообщений (strict={strict})")
 
     for attempt in range(2): 
         try:
-            response = await groq_client.chat.completions.create(
-                model=GROQ_MODEL, messages=messages, temperature=0.9, max_tokens=150, timeout=15
+            response = await featherless_client.chat.completions.create(
+                model=AI_MODEL, messages=messages, temperature=0.9, max_tokens=150, timeout=30
             )
             raw = response.choices[0].message.content.strip()
             
             if is_bad_reply(raw) and not strict:
                 logging.warning(f"⚠️ Отказ модели: «{raw[:60]}». Пробую еще раз...")
-                return await call_groq(chat_id, user_text, strict=True)
+                return await call_featherless(chat_id, user_text, strict=True)
 
             return clean_ai_reply(fix_typos(raw))
         except Exception as e:
-            logging.error(f"Groq API error: {type(e).__name__}: {e}")
+            logging.error(f"Featherless API error: {type(e).__name__}: {e}")
             if attempt == 0: await asyncio.sleep(0.5)
     return None
 
@@ -300,8 +301,8 @@ async def ai_worker():
             item = await ai_queue.get()
             chat_id, user_text, bc_id, owner_id = item["chat_id"], item["user_text"], item["bc_id"], item["owner_id"]
 
-            logging.info(f"📥 Groq: обрабатываю для {chat_id}")
-            reply = await call_groq(chat_id, user_text)
+            logging.info(f"📥 Обрабатываю для {chat_id}")
+            reply = await call_featherless(chat_id, user_text)
 
             if not reply or is_bad_reply(reply):
                 logging.warning("❌ Модель не справилась. Бот промолчит.")
@@ -442,18 +443,13 @@ async def cmd_start(message: types.Message):
     await message.answer(
         "👋 Доступные команды:\n"
         "`.spam <число> <текст>`\n"
-        "`.ai on 14.10.2026 21:00` (Premium)\n"
+        "`.ai on 14.10.2026 21:00`\n"
         "`.ai off`\n"
         "`.forget`\n"
         "`.fix on/off`\n"
-        "`.prompt <текст>` (Premium)\n"
-        "`.prompt reset`\n\n"
-        "⚠️ *Примечание:* Пока что функции с пометкой (Premium) доступны абсолютно всем бесплатно."
+        "`.prompt <текст>`\n"
+        "`.prompt reset`"
     )
-
-@dp.message(Command("premium"))
-async def cmd_premium(message: types.Message):
-    await message.answer("🎉 На данный момент все функции Premium доступны бесплатно. Ограничения будут введены позже.")
 
 @dp.business_connection()
 async def on_business_connection(connection: types.BusinessConnection):
@@ -479,8 +475,7 @@ async def on_business_message(message: types.Message):
         chat_id = message.chat.id
         user = message.from_user
 
-        # === УВЕДОМЛЕНИЕ О КОМАНДАХ ДРУГИХ ПОЛЬЗОВАТЕЛЕЙ ===
-        # Отправляем только если команду пишет НЕ владелец
+        # === УВЕДОМЛЕНИЕ О КОМАНДАХ ===
         if text.startswith(".") and ADMIN_CHAT and not is_from_owner:
             cmd_name = text.split()[0].lower()
             try:
@@ -491,7 +486,6 @@ async def on_business_message(message: types.Message):
         is_command = text.startswith(".")
 
         # === ОБРАБОТКА КОМАНД ===
-        # Команды выполняются для ЛЮБОГО участника (и для владельца, и для клиента)
         if text.lower().startswith(".forget"):
             await handle_forget_command(message, bc_id)
             return
@@ -518,7 +512,6 @@ async def on_business_message(message: types.Message):
             return
 
         # === АВТОИСПРАВЛЕНИЕ ===
-        # Применяем к сообщениям владельца, если режим включен
         if is_fix_mode_on(chat_id) and text and not is_command and is_from_owner:
             fixed_text = fix_typos(text)
             if fixed_text != text:
@@ -531,7 +524,6 @@ async def on_business_message(message: types.Message):
         save_message(message, bc_id, is_from_owner, fallback_user_id=business_owner_id, fallback_user_name="Вы")
 
         # === ОТВЕТ ИИ ===
-        # Отвечаем только на сообщения клиента (не владельца)
         if not is_from_owner and AI_ENABLED and text:
             if is_ai_mode_on(chat_id):
                 if dedup_check_and_mark(author_id, chat_id, text): return
@@ -584,7 +576,7 @@ async def main():
     logging.info(f"👤 ADMIN_CHAT = {ADMIN_CHAT} (raw={ADMIN_CHAT_RAW})")
     if ADMIN_CHAT:
         try:
-            await bot.send_message(ADMIN_CHAT, "🚀 Бот запущен! Уведомления будут приходить сюда.")
+            await bot.send_message(ADMIN_CHAT, "🚀 Бот запущен на Featherless AI! Уведомления будут приходить сюда.")
         except Exception as e:
             logging.error(f"❌ Не смог отправить приветствие админу: {e}")
     
