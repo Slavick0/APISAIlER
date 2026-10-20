@@ -17,6 +17,7 @@ from openai import AsyncOpenAI
 from spellchecker import SpellChecker
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+POLLINATIONS_API_KEY = os.getenv("POLLINATIONS_API_KEY")
 ADMIN_CHAT_RAW = os.getenv("ADMIN_CHAT", "0")
 try:
     ADMIN_CHAT = int(ADMIN_CHAT_RAW)
@@ -25,6 +26,8 @@ except (ValueError, TypeError):
 
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN не задан в Secrets!")
+if not POLLINATIONS_API_KEY:
+    raise ValueError("POLLINATIONS_API_KEY не задан в Secrets!")
 
 try:
     spell_ru = SpellChecker(language='ru')
@@ -39,14 +42,13 @@ GIGA_MIN_INTERVAL = 0.2
 SPAM_MAX = 20
 SPAM_DELAY = 0.7
 
-# Pollinations.ai совместим с OpenAI. Используем модель "openai".
-# Вы можете попробовать другие модели, например "openai-large" или "claude-hybridspace".
+# Модель Pollinations (можно попробовать "openai-large", "claude-hybridspace")
 AI_MODEL = "openai" 
 
-# Клиент Pollinations (OpenAI-совместимый). API-ключ не требуется, передаем заглушку.
+# Клиент Pollinations (OpenAI-совместимый)
 pollinations_client = AsyncOpenAI(
     base_url="https://gen.pollinations.ai/v1",
-    api_key="not-needed",
+    api_key=POLLINATIONS_API_KEY,
 )
 
 # ==================== АГРЕССИВНЫЙ ПРОМПТ ====================
@@ -76,7 +78,8 @@ BAD_PHRASES = [
     "к сожалению", "извините", "некорректные ответы", "ограничены", 
     "моя работа", "генерирую", "уточнение", "развернуть", "если хотите", 
     "рад помочь", "всегда пожалуйста", "задавайте вопросы", "я не человек", 
-    "я программа", "как языковая модель", "я не могу обсуждать", "я не могу участвовать"
+    "я программа", "как языковая модель", "я не могу обсуждать", "я не могу участвовать",
+    "i'm sorry", "i can't", "i cannot", "apologize", "apologies"
 ]
 
 def is_bad_reply(text):
@@ -290,7 +293,7 @@ async def call_pollinations(chat_id, user_text, strict=False):
             return clean_ai_reply(fix_typos(raw))
         except Exception as e:
             logging.error(f"Pollinations API error: {type(e).__name__}: {e}")
-            if attempt == 0: await asyncio.sleep(1.0) # Даем больше времени на повтор
+            if attempt == 0: await asyncio.sleep(1.0)
     return None
 
 # ==================== ОЧЕРЕДЬ ====================
