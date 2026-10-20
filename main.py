@@ -34,9 +34,9 @@ try:
 except Exception:
     spell_ru = None
 
-# ==================== НАСТРОЙКИ POLLINATIONS ====================
+# ==================== НАСТРОЙКИ ====================
 AI_ENABLED = True
-AI_HISTORY_LIMIT = 30
+DEFAULT_AI_HISTORY = 5  # Теперь по умолчанию 5 сообщений
 AI_QUEUE_MAXSIZE = 10
 GIGA_MIN_INTERVAL = 0.2
 SPAM_MAX = 20
@@ -111,8 +111,39 @@ def init_db():
     cursor.execute("CREATE TABLE IF NOT EXISTS ai_mode (chat_id INTEGER PRIMARY KEY, enabled INTEGER DEFAULT 0, started_at TEXT)")
     cursor.execute("CREATE TABLE IF NOT EXISTS fix_mode (chat_id INTEGER PRIMARY KEY, enabled INTEGER DEFAULT 0, started_at TEXT)")
     cursor.execute("CREATE TABLE IF NOT EXISTS custom_prompts (chat_id INTEGER PRIMARY KEY, prompt_text TEXT)")
+    # Таблица для Premium (добавлено поле history_limit)
+    cursor.execute("CREATE TABLE IF NOT EXISTS premium_users (user_id INTEGER PRIMARY KEY, expiry_date TEXT, history_limit INTEGER DEFAULT 5)")
     conn.commit()
     conn.close()
+
+def is_premium(user_id):
+    if not user_id: return False
+    conn = sqlite3.connect(DB_PATH); cursor = conn.cursor()
+    cursor.execute("SELECT expiry_date FROM premium_users WHERE user_id = ?", (user_id,))
+    row = cursor.fetchone(); conn.close()
+    if not row: return False
+    try:
+        expiry = datetime.fromisoformat(row[0])
+        return expiry > datetime.now()
+    except:
+        return False
+
+def grant_premium(user_id, days=30):
+    conn = sqlite3.connect(DB_PATH); cursor = conn.cursor()
+    expiry = (datetime.now() + timedelta(days=days)).isoformat()
+    cursor.execute("INSERT OR REPLACE INTO premium_users (user_id, expiry_date, history_limit) VALUES (?, ?, COALESCE((SELECT history_limit FROM premium_users WHERE user_id = ?), 5))", (user_id, expiry, user_id))
+    conn.commit(); conn.close()
+
+def set_user_limit(user_id, limit):
+    conn = sqlite3.connect(DB_PATH); cursor = conn.cursor()
+    cursor.execute("UPDATE premium_users SET history_limit = ? WHERE user_id = ?", (limit, user_id))
+    conn.commit(); conn.close()
+
+def get_user_limit(user_id):
+    conn = sqlite3.connect(DB_PATH); cursor = conn.cursor()
+    cursor.execute("SELECT history_limit FROM premium_users WHERE user_id = ?", (user_id,))
+    row = cursor.fetchone(); conn.close()
+    return row[0] if row and row[0] else DEFAULT_AI_HISTORY
 
 def set_custom_prompt(chat_id, prompt_text):
     conn = sqlite3.connect(DB_PATH); cursor = conn.cursor()
@@ -167,7 +198,7 @@ def is_ai_mode_on(chat_id):
     row = cursor.fetchone(); conn.close()
     return bool(row and row[0])
 
-def get_chat_history(chat_id, limit=30):
+def get_chat_history(chat_id, limit=5):
     reset_at = get_history_reset(chat_id)
     conn = sqlite3.connect(DB_PATH); cursor = conn.cursor()
     if reset_at:
@@ -228,7 +259,7 @@ def fix_typos(text):
     except Exception:
         return text
 
-# ==================== ДЕДУПЛИКАЦИЯ (ПО ID СООБЩЕНИЯ) ====================
+# ==================== ДЕДУПЛИКАЦИЯ ====================
 ai_queue = None
 PROCESSED_MESSAGE_IDS = set()
 
@@ -236,13 +267,12 @@ def is_duplicate_message(message_id):
     if message_id in PROCESSED_MESSAGE_IDS:
         return True
     PROCESSED_MESSAGE_IDS.add(message_id)
-    # Очищаем память, если накопилось больше 2000 ID
     if len(PROCESSED_MESSAGE_IDS) > 2000:
         PROCESSED_MESSAGE_IDS.clear()
     return False
 
 # ==================== POLLINATIONS ЗАПРОС ====================
-async def call_pollinations(chat_id, user_text, strict=False):
+async def call_pollinations(chat_id, user_text, owner_id, strict=False):
     if not AI_ENABLED or not pollinations_client: return None
 
     custom_prompt = get_custom_prompt(chat_id)
@@ -260,7 +290,10 @@ async def call_pollinations(chat_id, user_text, strict=False):
 
     corrected_user_text = fix_typos(user_text)
 
-    history = get_chat_history(chat_id, limit=AI_HISTORY_LIMIT)
+    # Получаем лимит истории для конкретного владельца
+    user_history_limit = get_user_limit(owner_id)
+    
+    history = get_chat_history(chat_id, limit=user_history_limit)
     messages = [{"role": "system", "content": system_content}]
     for is_from_owner, text in history:
         if not text: continue
@@ -270,7 +303,7 @@ async def call_pollinations(chat_id, user_text, strict=False):
     if not history or history[-1][1] != user_text:
         messages.append({"role": "user", "content": corrected_user_text})
 
-    logging.info(f"🧠 Pollinations ({AI_MODEL}): {len(messages)} сообщений (strict={strict})")
+    logging.info(f"🧠 Pollinations ({AI_MODEL}): {len(messages)} сообщений (strict={strict}, limit={user_history_limit})")
 
     for attempt in range(2): 
         try:
@@ -281,7 +314,7 @@ async def call_pollinations(chat_id, user_text, strict=False):
             
             if is_bad_reply(raw) and not strict:
                 logging.warning(f"⚠️ Отказ модели: «{raw[:60]}». Пробую еще раз...")
-                return await call_pollinations(chat_id, user_text, strict=True)
+                return await call_pollinations(chat_id, user_text, owner_id, strict=True)
 
             return clean_ai_reply(fix_typos(raw))
         except Exception as e:
@@ -297,7 +330,7 @@ async def ai_worker():
             chat_id, user_text, bc_id, owner_id = item["chat_id"], item["user_text"], item["bc_id"], item["owner_id"]
 
             logging.info(f"📥 Обрабатываю для {chat_id}")
-            reply = await call_pollinations(chat_id, user_text)
+            reply = await call_pollinations(chat_id, user_text, owner_id)
 
             if not reply or is_bad_reply(reply):
                 logging.warning("❌ Модель не справилась. Бот промолчит.")
@@ -443,8 +476,18 @@ async def cmd_start(message: types.Message):
         "`.forget`\n"
         "`.fix on/off`\n"
         "`.prompt <текст>`\n"
-        "`.prompt reset`"
+        "`.prompt reset`\n"
+        "`.limit <число>` (Premium - изменить глубину памяти)\n\n"
+        "⚠️ *Примечание:* Пока что функции с пометкой (Premium) доступны всем."
     )
+
+@dp.message(Command("premium"))
+async def cmd_premium(message: types.Message):
+    user = message.from_user
+    if is_premium(user.id):
+        await message.answer("✅ У вас активен Premium. Вам доступна команда `.limit <число>` для настройки памяти.")
+    else:
+        await message.answer("🎉 На данный момент все функции Premium доступны бесплатно.")
 
 @dp.business_connection()
 async def on_business_connection(connection: types.BusinessConnection):
@@ -482,6 +525,37 @@ async def on_business_message(message: types.Message):
 
         # === ОБРАБОТКА КОМАНД (ТОЛЬКО ДЛЯ ВЛАДЕЛЬЦА) ===
         if is_from_owner:
+            # Выдача премиума (команда только для Админа)
+            if text.startswith(".givepremium") and ADMIN_CHAT and author_id == ADMIN_CHAT:
+                parts = text.split()
+                if len(parts) > 1:
+                    try:
+                        target_id = int(parts[1])
+                        grant_premium(target_id, days=30)
+                        try: await bot(DeleteBusinessMessages(business_connection_id=bc_id, message_ids=[message.message_id]))
+                        except Exception: pass
+                        return await bot.send_message(chat_id=business_owner_id, text=f"✅ Пользователю {target_id} выдан Premium на 30 дней.", business_connection_id=bc_id)
+                    except ValueError:
+                        return await bot.send_message(chat_id=business_owner_id, text="❌ Неверный ID пользователя.", business_connection_id=bc_id)
+
+            # Изменение лимита истории (доступно только с Premium)
+            if text.startswith(".limit"):
+                if not is_premium(business_owner_id):
+                    return await bot.send_message(chat_id=business_owner_id, text="❌ Эта команда доступна только с Premium.", business_connection_id=bc_id)
+                
+                parts = text.split()
+                if len(parts) > 1:
+                    try:
+                        new_limit = int(parts[1])
+                        if new_limit < 1 or new_limit > 100:
+                            return await bot.send_message(chat_id=business_owner_id, text="❌ Лимит должен быть от 1 до 100.", business_connection_id=bc_id)
+                        set_user_limit(business_owner_id, new_limit)
+                        try: await bot(DeleteBusinessMessages(business_connection_id=bc_id, message_ids=[message.message_id]))
+                        except Exception: pass
+                        return await bot.send_message(chat_id=business_owner_id, text=f"✅ Глубина памяти изменена на {new_limit} сообщений.", business_connection_id=bc_id)
+                    except ValueError:
+                        return await bot.send_message(chat_id=business_owner_id, text="❌ Неверное число.", business_connection_id=bc_id)
+
             if text.lower().startswith(".forget"):
                 await handle_forget_command(message, bc_id)
                 return
@@ -572,7 +646,7 @@ async def main():
     logging.info(f"👤 ADMIN_CHAT = {ADMIN_CHAT} (raw={ADMIN_CHAT_RAW})")
     if ADMIN_CHAT:
         try:
-            await bot.send_message(ADMIN_CHAT, "🚀 Бот запущен на Pollinations.ai! Уведомления будут приходить сюда.")
+            await bot.send_message(ADMIN_CHAT, "🚀 Бот запущен! Уведомления будут приходить сюда.")
         except Exception as e:
             logging.error(f"❌ Не смог отправить приветствие админу: {e}")
     
