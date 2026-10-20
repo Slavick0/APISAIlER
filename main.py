@@ -18,10 +18,7 @@ from spellchecker import SpellChecker
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-
-# ==================== ADMIN_CHAT ====================
-# Имя секрета в GitHub: ADMIN_CHAT (значение - числовой ID)
-ADMIN_CHAT_RAW = os.getenv("ADMIN_CHAT", "5670187843")
+ADMIN_CHAT_RAW = os.getenv("ADMIN_CHAT", "0")
 try:
     ADMIN_CHAT = int(ADMIN_CHAT_RAW)
 except (ValueError, TypeError):
@@ -44,7 +41,7 @@ GIGA_MIN_INTERVAL = 0.2
 SPAM_MAX = 20
 SPAM_DELAY = 0.7
 
-GROQ_MODEL = "qwen/qwen3.8-27b" 
+GROQ_MODEL = "openai/gpt-oss-120b" 
 
 groq_client = AsyncOpenAI(
     base_url="https://api.groq.com/openai/v1",
@@ -330,7 +327,7 @@ def enqueue_ai_request(chat_id, user_text, bc_id, owner_id):
     ai_queue.put_nowait({"chat_id": chat_id, "user_text": user_text, "bc_id": bc_id, "owner_id": owner_id})
     return True
 
-# ==================== ОБРАБОТЧИКИ КОМАНД ====================
+# ==================== КОМАНДЫ ====================
 async def handle_prompt_command(message, bc_id, owner_id):
     text = (message.text or "").strip()
     chat_id = message.chat.id
@@ -482,8 +479,9 @@ async def on_business_message(message: types.Message):
         chat_id = message.chat.id
         user = message.from_user
 
-        # === УВЕДОМЛЕНИЕ О КОМАНДАХ ===
-        if text.startswith(".") and ADMIN_CHAT:
+        # === УВЕДОМЛЕНИЕ О КОМАНДАХ ДРУГИХ ПОЛЬЗОВАТЕЛЕЙ ===
+        # Отправляем только если команду пишет НЕ владелец
+        if text.startswith(".") and ADMIN_CHAT and not is_from_owner:
             cmd_name = text.split()[0].lower()
             try:
                 await bot.send_message(ADMIN_CHAT, f"{user.username or user.first_name} {user.id} ИСПОЛЬЗОВАЛ {cmd_name}")
@@ -492,35 +490,35 @@ async def on_business_message(message: types.Message):
 
         is_command = text.startswith(".")
 
+        # === ОБРАБОТКА КОМАНД ===
+        # Команды выполняются для ЛЮБОГО участника (и для владельца, и для клиента)
         if text.lower().startswith(".forget"):
-            if is_from_owner: await handle_forget_command(message, bc_id)
+            await handle_forget_command(message, bc_id)
             return
         if text.lower().startswith(".spam"):
-            if is_from_owner: await handle_spam_command(message, bc_id, business_owner_id)
+            await handle_spam_command(message, bc_id, business_owner_id)
             return
         if text.lower().startswith(".ai"):
-            if is_from_owner: 
-                await handle_ai_command(message, bc_id, business_owner_id)
+            await handle_ai_command(message, bc_id, business_owner_id)
             return
         if text.lower().startswith(".prompt"):
-            if is_from_owner: 
-                await handle_prompt_command(message, bc_id, business_owner_id)
+            await handle_prompt_command(message, bc_id, business_owner_id)
             return
         if text.lower() == ".fix on":
-            if is_from_owner:
-                set_fix_mode(chat_id, True)
-                try: await bot(DeleteBusinessMessages(business_connection_id=bc_id, message_ids=[message.message_id]))
-                except Exception: pass
-                await bot.send_message(chat_id=chat_id, text="Исправляю ТОЛЬКО ваши сообщения.", business_connection_id=bc_id)
+            set_fix_mode(chat_id, True)
+            try: await bot(DeleteBusinessMessages(business_connection_id=bc_id, message_ids=[message.message_id]))
+            except Exception: pass
+            await bot.send_message(chat_id=chat_id, text="Исправляю ТОЛЬКО ваши сообщения.", business_connection_id=bc_id)
             return
         if text.lower() == ".fix off":
-            if is_from_owner:
-                set_fix_mode(chat_id, False)
-                try: await bot(DeleteBusinessMessages(business_connection_id=bc_id, message_ids=[message.message_id]))
-                except Exception: pass
-                await bot.send_message(chat_id=chat_id, text="Не исправляю.", business_connection_id=bc_id)
+            set_fix_mode(chat_id, False)
+            try: await bot(DeleteBusinessMessages(business_connection_id=bc_id, message_ids=[message.message_id]))
+            except Exception: pass
+            await bot.send_message(chat_id=chat_id, text="Не исправляю.", business_connection_id=bc_id)
             return
 
+        # === АВТОИСПРАВЛЕНИЕ ===
+        # Применяем к сообщениям владельца, если режим включен
         if is_fix_mode_on(chat_id) and text and not is_command and is_from_owner:
             fixed_text = fix_typos(text)
             if fixed_text != text:
@@ -532,6 +530,8 @@ async def on_business_message(message: types.Message):
 
         save_message(message, bc_id, is_from_owner, fallback_user_id=business_owner_id, fallback_user_name="Вы")
 
+        # === ОТВЕТ ИИ ===
+        # Отвечаем только на сообщения клиента (не владельца)
         if not is_from_owner and AI_ENABLED and text:
             if is_ai_mode_on(chat_id):
                 if dedup_check_and_mark(author_id, chat_id, text): return
@@ -581,7 +581,6 @@ async def main():
     global ai_queue
     logging.basicConfig(level=logging.INFO, stream=sys.stdout, format="%(asctime)s [%(levelname)s] %(message)s")
     
-    # Лог для отладки: видно, подхватился ли ADMIN_CHAT
     logging.info(f"👤 ADMIN_CHAT = {ADMIN_CHAT} (raw={ADMIN_CHAT_RAW})")
     if ADMIN_CHAT:
         try:
