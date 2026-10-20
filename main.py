@@ -42,10 +42,8 @@ GIGA_MIN_INTERVAL = 0.2
 SPAM_MAX = 20
 SPAM_DELAY = 0.7
 
-# Модель Pollinations (можно попробовать "openai-large", "claude-hybridspace")
 AI_MODEL = "openai" 
 
-# Клиент Pollinations (OpenAI-совместимый)
 pollinations_client = AsyncOpenAI(
     base_url="https://gen.pollinations.ai/v1",
     api_key=POLLINATIONS_API_KEY,
@@ -230,22 +228,17 @@ def fix_typos(text):
     except Exception:
         return text
 
-# ==================== ДЕДУПЛИКАЦИЯ ====================
-DEDUP_CACHE = {}
-DEDUP_TTL = 30
+# ==================== ДЕДУПЛИКАЦИЯ (ПО ID СООБЩЕНИЯ) ====================
 ai_queue = None
+PROCESSED_MESSAGE_IDS = set()
 
-def dedup_check_and_mark(sender_id, chat_id, text):
-    try:
-        loop = asyncio.get_event_loop()
-        now = loop.time()
-    except Exception:
-        now = 0
-    for k in list(DEDUP_CACHE.keys()):
-        if now - DEDUP_CACHE[k] > DEDUP_TTL: del DEDUP_CACHE[k]
-    key = (sender_id, chat_id, (text or "").strip().lower())
-    if key in DEDUP_CACHE: return True
-    DEDUP_CACHE[key] = now
+def is_duplicate_message(message_id):
+    if message_id in PROCESSED_MESSAGE_IDS:
+        return True
+    PROCESSED_MESSAGE_IDS.add(message_id)
+    # Очищаем память, если накопилось больше 2000 ID
+    if len(PROCESSED_MESSAGE_IDS) > 2000:
+        PROCESSED_MESSAGE_IDS.clear()
     return False
 
 # ==================== POLLINATIONS ЗАПРОС ====================
@@ -529,7 +522,7 @@ async def on_business_message(message: types.Message):
         # === ОТВЕТ ИИ (ТОЛЬКО НА СООБЩЕНИЯ СОБЕСЕДНИКА) ===
         if not is_from_owner and AI_ENABLED and text:
             if is_ai_mode_on(chat_id):
-                if dedup_check_and_mark(author_id, chat_id, text): return
+                if is_duplicate_message(message.message_id): return
                 enqueue_ai_request(chat_id, text, bc_id, business_owner_id)
             else:
                 logging.info(f"💤 AI ВЫКЛ для чата {chat_id}")
