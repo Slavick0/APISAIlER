@@ -29,7 +29,6 @@ jobs:
           pip install --no-cache-dir --force-reinstall -r requirements.txt
       - run: python main.py
         env:
-          # Явно передаем секреты из GitHub в код Python
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-          FEATHERLESS_API_KEY: ${{ secrets.FEATHERLESS_API_KEY }}
+          POLLINATIONS_API_KEY: ${{ secrets.POLLINATIONS_API_KEY }}
           ADMIN_CHAT: ${{ secrets.ADMIN_CHAT }}
